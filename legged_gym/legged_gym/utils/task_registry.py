@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -212,10 +212,11 @@ class TaskRegistry():
         # save resume path before creating a new log_dir
         resume = train_cfg.runner.resume
         if resume:
+            play_name = train_cfg.play if hasattr(train_cfg, 'play') else False
             # load previously trained model
             resume_path = get_load_path(log_root,
                                         load_run=train_cfg.runner.load_run,
-                                        checkpoint=train_cfg.runner.checkpoint)
+                                        checkpoint=train_cfg.runner.checkpoint,play=play_name)
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
         return runner, train_cfg

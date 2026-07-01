@@ -1,17 +1,15 @@
 from isaacgym.torch_utils import *
-from legged_gym.utils.gym_math import get_euler_xyz
 
 from legged_gym.envs.fftai.legged_robot_fftai_bipedal_code import LeggedRobotFFTAIBipedal
-from legged_gym.envs.n1.n1_config import N1Cfg
-
+from legged_gym.envs.n1test.n1_config import N1Cfg
+from legged_gym.utils.gym_math import get_euler_xyz
 
 class N1(LeggedRobotFFTAIBipedal):
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         self.cfg: N1Cfg = cfg
+
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
-        self.last_feet_z = 0.05
-        self.feet_height = torch.zeros((self.num_envs, 2), device=self.device)
 
     def compute_observation_profile(self):
 
@@ -30,7 +28,6 @@ class N1(LeggedRobotFFTAIBipedal):
 
                 # action related
                 self.actions * self.obs_scales.action,
-                self.swing_clock
             ), dim=-1)
 
         pri_obs_buf = torch.cat(
@@ -175,7 +172,7 @@ class N1(LeggedRobotFFTAIBipedal):
 
     # ==========================================================================================================================
     # Reward functions
-    def _reward_feet_orient(self):
+    def _reward_feet_orientA(self):
         """
         奖励足部方向与躯干方向一致
         """
@@ -195,7 +192,6 @@ class N1(LeggedRobotFFTAIBipedal):
         reward_feet_rot = torch.exp(-1.0 * (error_left[:,2]+error_right[:,2]))
         return reward_feet_rot
 
-
     def _reward_feet_plane(self):
         """
         奖励足部平面与地面平行
@@ -209,12 +205,13 @@ class N1(LeggedRobotFFTAIBipedal):
         right_foot_euler = get_euler_xyz(right_foot_rot)
         target_euler_left = torch.zeros_like(base_euler)
         target_euler_right = torch.zeros_like(base_euler)
-        target_euler_left[:,1] = 0.2 * self.swing_mask[:,0]
-        target_euler_right[:,1] = 0.2 * self.swing_mask[:,1]
+        # target_euler_left[:,1] = 0.2 * self.swing_mask[:,0]
+        # target_euler_right[:,1] = 0.2 * self.swing_mask[:,1]
+        target_euler_left[:,1] = 0.2
 
         # print("base_euler",base_euler)
-        # print("left_foot_euler",left_foot_euler)
-        # print("right_foot_euler",right_foot_euler)
+        print("left_foot_euler",left_foot_euler)
+        print("right_foot_euler",right_foot_euler)
         error_left = torch.abs(base_euler - left_foot_euler - target_euler_left)
         error_right = torch.abs(base_euler - right_foot_euler - target_euler_right)
 
@@ -222,125 +219,46 @@ class N1(LeggedRobotFFTAIBipedal):
         # print("error_right",error_right)
         # error_plane = error_left + error_right
         # reward_feet_plane = torch.exp(-3.0 * (error_plane[:,0] + error_plane[:,1]))
-        reward_left_plane = 1. * torch.exp(-3.0 * error_left[:,1]) + 0.5 * torch.exp(-10.0 * error_left[:,0]) + 0.5 * torch.exp(-10.0 * error_left[:,2])
-        reward_right_plane = 1. * torch.exp(-3.0 * error_right[:,1]) + 0.5 * torch.exp(-10.0 * error_right[:,0]) + 0.5 * torch.exp(-10.0 * error_right[:,2])
-        return reward_left_plane + reward_right_plane
+        reward_left_plane = 1. * torch.exp(-4.0 * error_left[:,1]) + 0.3 * torch.exp(-10.0 * error_left[:,0]) + 0.3 * torch.exp(-15.0 * error_left[:,2])
+        reward_right_plane = 1. * torch.exp(-4.0 * error_right[:,1]) + 0.3 * torch.exp(-10.0 * error_right[:,0]) + 0.3 * torch.exp(-15.0 * error_left[:,2])
+        return (reward_left_plane + reward_right_plane)/2
 
+    def _reward_feet_orientB(self):
+          """
+          奖励足部方向一致
+          """
+          left_foot_rot = self.rigid_body_states[:, self.feet_indices[0]][:,3:7]
+          right_foot_rot = self.rigid_body_states[:, self.feet_indices[1]][:,3:7]
+          left_foot_rot_rev = quat_conjugate(left_foot_rot)
+          right_foot_rot_rev = quat_conjugate(right_foot_rot)
+          left_foot_direction = quat_rotate_inverse(left_foot_rot_rev,self.forward_vec)
+          right_foot_direction = quat_rotate_inverse(right_foot_rot_rev,self.forward_vec)
+          error_feet_rot = torch.abs(left_foot_direction - right_foot_direction)
+          error_feet_rot = torch.sum(error_feet_rot[:,0:2], dim=1)  # dims 2->1
 
-    def _reward_feet_swing_high(self):
-        # 奖励高于target_height
-        rew_pos = (self.cfg.rewards.target_feet_height - self.feet_height) * 100 # unit: mm
-        rew_pos = torch.clip(rew_pos, -6, 100)
-        rew_pos = torch.exp(-0.3 * rew_pos)
-        rew_pos *= self.swing_mask
-        rew_pos = torch.sum(rew_pos, dim=1)
-        return rew_pos
+          reward_feet_rot = torch.exp(self.cfg.rewards.sigma_feet_orient * error_feet_rot)
+          return reward_feet_rot
+    def _reward_ref_action(self):
+        cycle_time = 0.9
+        phase = self.episode_length_buf * self.dt / cycle_time
+        sin_pos = torch.sin(2 * torch.pi * phase)
+        sin_pos_l = sin_pos.clone()
+        sin_pos_r = sin_pos.clone()
+        self.ref_dof_pos = torch.zeros_like(self.dof_pos)
+        scale_1 = 0.2
+        scale_2 = 2 * scale_1
+        # left foot stance phase set to default joint pos
+        # sin_pos_l[sin_pos_l > 0] = 0
+        self.ref_dof_pos[:, 2] = sin_pos_l * scale_1
+        # self.ref_dof_pos[:, 3] = -sin_pos_l * scale_2
+        # self.ref_dof_pos[:, 5] = sin_pos_l * scale_1
+        # right foot stance phase set to default joint pos
+        # sin_pos_r[sin_pos_r < 0] = 0
+        self.ref_dof_pos[:, 8] = -sin_pos_r * scale_1
+        # self.ref_dof_pos[:, 9] = sin_pos_r * scale_2
+        # self.ref_dof_pos[:, 11] = -sin_pos_r * scale_1
+        # Double support phase
+        self.ref_dof_pos[torch.abs(sin_pos) < 0.1] = 0
 
-    def _reward_feet_swing_low(self):
-        # 惩罚低于target_height/2
-        pen_pos = (self.cfg.rewards.target_feet_height/2 - self.feet_height) * 100 # unit: mm
-        pen_pos = torch.clip(pen_pos, 0, 20)
-        pen_pos = 1 - torch.exp(0.2 * pen_pos)
-        pen_pos *= self.swing_mask
-        pen_pos = torch.sum(pen_pos, dim=1)
-        return pen_pos
-
-    def _reward_feet_swing_too_high(self):
-        # 惩罚高于target_height*2
-        pen_pos_high = (self.feet_height - self.cfg.rewards.target_feet_height * 1.5) * 100 # unit: mm
-        pen_pos_high = torch.clip(pen_pos_high, 0, 20)
-        pen_pos_high = 1 - torch.exp(0.3 * pen_pos_high)
-        pen_pos_high *= self.swing_mask
-        pen_pos_high = torch.sum(pen_pos_high, dim=1)
-        return pen_pos_high
-
-    def _reward_feet_support_high(self):
-        # 惩罚支撑脚高于target_height/2
-        pen_pos_low = (self.feet_height - self.cfg.rewards.target_feet_height/2) * 100 # unit: mm
-        pen_pos_low = torch.clip(pen_pos_low, 0, 20)
-        pen_pos_low = 1 - torch.exp(0.3 * pen_pos_low)
-        pen_pos_low *= self.stance_mask
-        pen_pos_low = torch.sum(pen_pos_low, dim=1)
-        return pen_pos_low
-
-    def _reward_feet_support_low(self):
-        # # 奖励支撑脚贴近地面
-        rew_pos_low = (self.feet_height)*100 # unit: mm
-        rew_pos_low = torch.clip(rew_pos_low, 0, 100)
-        rew_pos_low = torch.exp(-0.2 * rew_pos_low)
-        rew_pos_low *= self.stance_mask
-        rew_pos_low = torch.sum(rew_pos_low, dim=1)
-        return rew_pos_low
-
-
-    # def _reward_feet_clearance(self):
-    #     """
-    #     Calculates reward based on the clearance of the swing leg from the ground during movement.
-    #     Encourages appropriate lift of the feet during the swing phase of the gait.
-    #     """
-    #     # Compute feet contact mask
-    #     feet_z = self.rigid_body_states[:, self.feet_indices, 2] - 0.10
-    #     # contact = torch.zeros_like(feet_z)
-    #     # max_indices = torch.argmin(feet_z, dim=1)
-    #     # contact[torch.arange(feet_z.size(0)), max_indices] = 1
-    #     # contact = contact.bool()
-    #     contact = self.contact_forces[:, self.feet_indices, 2] > 5.
-
-    #     # Get the z-position of the feet and compute the change in z-position
-
-    #     delta_z = feet_z - self.last_feet_z
-    #     self.feet_height += delta_z
-    #     self.last_feet_z = feet_z
-
-
-    #     # 奖励高于target_height
-    #     rew_pos = (self.cfg.rewards.target_feet_height - self.feet_height) * 100 # unit: mm
-    #     rew_pos = torch.clip(rew_pos, -6, 100)
-    #     rew_pos = torch.exp(-0.2 * rew_pos)
-    #     rew_pos *= self.swing_mask
-    #     # 惩罚低于target_height/2
-    #     pen_pos = (self.cfg.rewards.target_feet_height/2 - self.feet_height) * 100 # unit: mm
-    #     pen_pos = torch.clip(pen_pos, 0, 20)
-    #     pen_pos = 1 - torch.exp(0.2 * pen_pos)
-    #     pen_pos *= self.swing_mask
-    #     # 惩罚高于target_height*2
-    #     pen_pos_high = (self.feet_height - self.cfg.rewards.target_feet_height * 1.5) * 100 # unit: mm
-    #     pen_pos_high = torch.clip(pen_pos_high, 0, 20)
-    #     pen_pos_high = 1 - torch.exp(0.3 * pen_pos_high)
-    #     pen_pos_high *= self.swing_mask
-    #     # 惩罚支撑脚高于target_height/2
-    #     pen_pos_low = (self.feet_height - self.cfg.rewards.target_feet_height/4) * 100 # unit: mm
-    #     pen_pos_low = torch.clip(pen_pos_high, 0, 20)
-    #     pen_pos_low = 1 - torch.exp(0.3 * pen_pos_high)
-    #     pen_pos_low *= self.stance_mask
-    #     # 奖励支撑脚贴近地面
-    #     rew_pos_low = (self.feet_height)*100 # unit: mm
-    #     rew_pos_low = torch.exp(-0.2 * rew_pos_low)
-    #     rew_pos_low *= self.stance_mask
-    #     print(self.feet_height)
-
-    #     rew_pos = torch.sum(rew_pos, dim=1) + torch.sum(pen_pos, dim=1) + torch.sum(pen_pos_high, dim=1) + torch.sum(pen_pos_low, dim=1) + torch.sum(rew_pos_low, dim=1)
-    #     self.feet_height *= ~contact
-    #     return rew_pos
-    def _reward_feet_contact_forces(self):
-        """
-        Calculates the reward for keeping contact forces within a specified range. Penalizes
-        high contact forces on the feet.
-        Uses a squared penalty to heavily punish large, brief spikes.
-        """
-        # 计算左右脚的接触力幅值 (num_envs, 2)
-        forces_norm = torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1)
-        # print(self.episode_length_buf)
-        # print(forces_norm)
-        # print(self.contact_forces_limit)
-
-        # 超限部分：低于 0.75 * limit 的部分不计，超出的部分使用平方惩罚
-        excess = (forces_norm - self.contact_forces_limit * 0.9).clamp(min=0,max=2000)
-        penalty = torch.sum(excess, dim=1)  # 平方后对各脚求和
-
-        steps = self.episode_length_buf.float()   # 确保为浮点，shape: (num_envs,)
-        weight = torch.clamp((steps - 100) / 200.0, 0.0, 1.0)  # 计算权重，shape: (num_envs,)
-        # print(penalty)
-        # print(weight)
-
-        return penalty * weight
+        self.ref_action = 2 * self.ref_dof_pos
+        return 0

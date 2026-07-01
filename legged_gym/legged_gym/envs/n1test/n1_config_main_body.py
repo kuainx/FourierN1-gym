@@ -1,6 +1,6 @@
 import numpy
 
-from legged_gym.envs.n1.n1_config import (
+from legged_gym.envs.n1test.n1_config import (
     N1Cfg as N1BaseCfg,
     N1CfgPPO as N1BaseCfgPPO,
 )
@@ -11,12 +11,12 @@ class N1MainBodyCfg(N1BaseCfg):
         # episode length in seconds
         episode_length_s = 20
 
-        num_obs = 48+2
-        num_pri_obs = 181+2
+        num_obs = 48
+        num_pri_obs = 181
         num_actions = (6 + 6 + 1)
 
         use_stack = True
-        num_stack = 20
+        num_stack = 5
 
     class asset(N1BaseCfg.asset):
         file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/N1/urdf/N1_main_body_raw.urdf"
@@ -34,25 +34,25 @@ class N1MainBodyCfg(N1BaseCfg):
         # gap, pit,
         # ]
         terrain_proportions = [
-            0.1, 0.1,
-            0.2, 0.2,
-            0.1, 0.1,
-            0.1, 0.1,
+            0.5, 0.5,
+            0.0, 0.0,
+            0.0, 0.0,
+            0.0, 0.0,
             0.0, 0.0,
             0.0, 0.0,
         ]
 
     class rewards(N1BaseCfg.rewards):
         class scales(N1BaseCfg.rewards.scales):
-            stand_still_dof_pos_waist_joint = 0.25
-            stand_still_foot_distance = 0.50
+            stand_still_dof_pos_waist_joint = 0.50
+            stand_still_foot_distance = 0.25
 
             """
             base related
             """
-            cmd_diff_base_lin_vel_x = 1.5
-            cmd_diff_base_lin_vel_y = 1.0
-            cmd_diff_base_ang_vel_yaw = 1.0
+            cmd_diff_base_lin_vel_x = 1.00
+            cmd_diff_base_lin_vel_y = 0.50
+            cmd_diff_base_ang_vel_yaw = 0.75
 
             base_lin_vel_z = 0.25
 
@@ -64,13 +64,13 @@ class N1MainBodyCfg(N1BaseCfg):
             """
             dof related
             """
-            action_diff = -4.00
-            action_diff_diff = -0.50
+            action_diff = -5.00
+            action_diff_diff = -1.10
 
             dof_pos_offset = 0.50
             # dof_vel = -0.20
             dof_acc = -0.25
-            dof_tor = -0.10
+            dof_tor = -0.05
 
             limits_dof_pos_without_ankle = -10.00
             limits_dof_vel_without_ankle = -5.00
@@ -79,34 +79,27 @@ class N1MainBodyCfg(N1BaseCfg):
             """
             feet related
             """
-            feet_speed_xy_close_to_ground = 0.50
-            feet_force_z_close_to_ground = -0.50
-            feet_stumble = -5.0
+            feet_speed_xy_close_to_ground = 0.20
+            feet_force_z_close_to_ground = -0.20
+            feet_stumble = -0.20
             feet_distance_too_close = -0.50
-            feet_distance_y_too_close = -1.0
-            feet_distance_y_too_far = -1.0
+            feet_distance_y_too_close = -0.50
 
             feet_air_time = 2.00  # two feet -> 1.0
-            feet_orient = 0.4
-            feet_plane = 0.3
 
-            # feet_clearance = 0.8
-            feet_swing_high = 0.3
-            feet_swing_low = 0.4
-            feet_swing_too_high = 0.25
-            feet_support_high = 0.5
-            feet_support_low = 0.3
-            feet_contact_forces = -0.02
+            ref_action = 0.1
+            feet_orientA = 0.1
+            feet_plane = 0.1
 
     class normalization(N1BaseCfg.normalization):
         actions_max = numpy.array([
-            2.618, 1.571, 1.571, 2.356, 0.436, 0.436,  # left leg
-            2.618, 0.262, 1.571, 2.356, 0.436, 0.436,  # right leg
+            2.618, 1.571, 1.571, 2.356, 0.436, 0.785,  # left leg
+            2.618, 0.262, 1.571, 2.356, 0.436, 0.785,  # right leg
             2.618,  # waist
         ])
         actions_min = numpy.array([
-            -2.618, -0.262, -1.571, -0.087, -0.436, -0.436,  # left leg
-            -2.618, -1.571, -1.571, -0.087, -0.436, -0.436,  # right leg
+            -2.618, -0.262, -1.571, -0.087, -0.436, -0.785,  # left leg
+            -2.618, -1.571, -1.571, -0.087, -0.436, -0.785,  # right leg
             -2.618,  # waist
         ])
 
@@ -115,15 +108,15 @@ class N1MainBodyCfg(N1BaseCfg):
         clip_actions_max = \
             actions_max \
             + numpy.array([
-                1.0, 1.0, 1.0, 1.0, 1.0, 0.5,  # left leg
-                1.0, 1.0, 1.0, 1.0, 1.0, 0.5,  # right leg
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # left leg
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # right leg
                 1.0,  # waist
             ])
         clip_actions_min = \
             actions_min \
             - numpy.array([
-                1.0, 1.0, 1.0, 1.0, 1.0, 0.5,  # left leg
-                1.0, 1.0, 1.0, 1.0, 1.0, 0.5, # right leg
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # left leg
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # right leg
                 1.0,  # waist
             ])
 
@@ -155,7 +148,6 @@ class N1MainBodyCfg(N1BaseCfg):
                     1.0, -1.0, -1.0, 1.0, -1.0, 1.0,  # actions (left leg)
                     1.0, -1.0, -1.0, 1.0, -1.0, 1.0,  # actions (right leg)
                     -1.0,  # actions (waist)
-                    1.0,1.0
                 ]
             )
         observations_exchange = \
@@ -168,7 +160,6 @@ class N1MainBodyCfg(N1BaseCfg):
                     *[(22 + i, 22 + 6 + i) for i in range(6)],  # dof related (dof_vel)
                     # action related
                     *[(35 + i, 35 + 6 + i) for i in range(6)],
-                    (48,49)
                 ]
             )
         actions_coefficient = \
@@ -190,7 +181,6 @@ class N1MainBodyCfgPPO(N1BaseCfgPPO, N1MainBodyCfg):
 
     class algorithm(N1BaseCfgPPO.algorithm):
         class_name = "PPOMirror"
-        # mirror_coef = 0.25
 
     class policy(N1BaseCfgPPO.policy):
         init_noise_std = [0.2] * N1MainBodyCfg.env.num_actions

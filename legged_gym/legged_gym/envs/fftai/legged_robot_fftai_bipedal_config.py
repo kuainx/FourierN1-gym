@@ -83,11 +83,12 @@ class LeggedRobotFFTAIBipedalCfg(LeggedRobotFFTAICfg):
         stand_still_foot_distance = 0.20  # unit: m
 
         feet_distance_too_close = max(stand_still_foot_distance - 0.10, 0.10)  # m
-        feet_distance_y_too_close = max(stand_still_foot_distance / 4.0 * 3.0, 0.10)  # unit: m
+        feet_distance_y_too_close = max(stand_still_foot_distance * 0.8, 0.10)  # unit: m
+        feet_distance_y_too_far = max(stand_still_foot_distance * 1.2, 0.10)  # unit: m
 
         feet_force_z_close_to_ground_contact_force_limit_ratio = 1.0
 
-        feet_air_time_target = 0.4  # unit: s
+        feet_air_time_target = 0.5  # unit: s
 
         # ---------------------------------------------------------------
         # Reward coefficients
@@ -95,11 +96,12 @@ class LeggedRobotFFTAIBipedalCfg(LeggedRobotFFTAICfg):
 
         sigma_feet_distance_too_close = -10.0 * torch.e
         sigma_feet_distance_y_too_close = -10.0 * torch.e
+        sigma_feet_distance_y_too_far = -10.0 * torch.e
 
         sigma_feet_speed_xy_close_to_ground = -10.0
         sigma_feet_force_z_close_to_ground = -0.01 * torch.e
 
-        sigma_feet_air_time = -1.0 * torch.e
+        sigma_feet_air_time = -0.75 * torch.e
 
         class scales(LeggedRobotFFTAICfg.rewards.scales):
             pass

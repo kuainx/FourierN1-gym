@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -129,7 +129,7 @@ class LeggedRobotCfg(BaseConfig):
         payload_name = "None"
 
         terminate_contacts_on = [
-            "base"
+            "base","thigh","shank"
         ]
         terminate_project_gravity_less_than = 0.33  # ~70 degrees
 
@@ -261,14 +261,14 @@ class LeggedRobotCfg(BaseConfig):
 
         # randomize friction and restitution
         randomize_friction = True
-        friction_range = [0.30, 1.70]  # [0.35, 1.65]  # [0.25, 1.75]
+        friction_range = [0.25, 1.75] #[0.30, 1.70]  # [0.35, 1.65]  #
 
         randomize_restitution = True
         restitution_range = [0.0, 0.7]  # 0.0: no bounce, 1.0: perfect bounce
 
         # randomize base mass
         randomize_base_mass = True
-        multiply_base_mass_range = [0.9, 1.1]  # unit : kg
+        multiply_base_mass_range = [0.85, 1.3]  # unit : kg
 
         # randomize base center of mass
         randomize_base_com = True

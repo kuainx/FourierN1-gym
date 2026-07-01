@@ -1,0 +1,5 @@
+python scripts/train.py --task=N1Run --headless --num_envs=6144 --run_name=runa1
+python scripts/play.py --task=N1Run --num_envs=1 --run_name=runa1
+python scripts/train.py --task=N1 --headless --num_envs=6144 --run_name=c1
+python scripts/play.py --task=N1 --num_envs=1 --run_name=c1
+python scripts/testplay.py

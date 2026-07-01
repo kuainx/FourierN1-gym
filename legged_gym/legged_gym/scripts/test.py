@@ -40,13 +40,20 @@ import wandb
 
 
 def train(args):
+    args.task = "N1test"
+    args.num_envs = 1
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
+    env_cfg.terrain.mesh_type='plane'
+    env_cfg.asset.fix_base_link=True
+    env_cfg.init_state.pos=[0,0,2]
+    # override some parameters for testing
+    # env.num_envs =  1
     ppo_runner, train_cfg = task_registry.make_alg_runner(
         env=env, name=args.task, args=args
     )
     exp_name = args.run_name + datetime.now().strftime("-%Y%m%d-%H%M%S")
-    wandb.init(project="fftai-"+args.task.lower(), config=train_cfg, name=exp_name, sync_tensorboard=True)
-    wandb.save("./envs/"+args.task.lower()+"/*")
+    wandb.init(project="fftai-n1test", config=train_cfg, name=exp_name, sync_tensorboard=True)
+    wandb.save("./envs/n1/*")
     wandb.save("./envs/fftai/*")
     ppo_runner.learn(
         num_learning_iterations=train_cfg.runner.max_iterations,

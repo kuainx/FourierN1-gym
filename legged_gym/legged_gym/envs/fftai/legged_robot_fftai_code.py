@@ -40,10 +40,11 @@ class LeggedRobotFFTAI(LeggedRobot):
         self.feet_air_time_last = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device, requires_grad=False)
 
         # feet pos, height
-        self.feet_pos = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device, requires_grad=False)
-        self.feet_quat = torch.zeros(self.num_envs, len(self.feet_indices), 4, device=self.device, requires_grad=False)
+        self.feet_pos = torch.zeros(self.num_envs, len(self.feet_indices), 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.feet_quat = torch.zeros(self.num_envs, len(self.feet_indices), 4, dtype=torch.float, device=self.device, requires_grad=False)
 
         self.feet_height = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device, requires_grad=False)
+        self.feet_pos_to_base = torch.zeros(self.num_envs, len(self.feet_indices), 3, dtype=torch.float, device=self.device, requires_grad=False)
 
     # ----------------------------------------------
 
@@ -74,6 +75,9 @@ class LeggedRobotFFTAI(LeggedRobot):
 
         self._calculate_feet_contact()
         self._calculate_feet_height()
+        self._calculate_feet_distance()
+        self._calc_swing_mask()
+        self._calc_feet_height()
 
     def _calculate_feet_contact(self):
         self.feet_contact_last = self.feet_contact.clone()
@@ -100,11 +104,9 @@ class LeggedRobotFFTAI(LeggedRobot):
 
     def _calculate_feet_height(self):
         self.feet_pos = self.rigid_body_states[:, self.feet_indices][:, 0:len(self.feet_indices), 0:3]  # in world frame
-        self.feet_quat = self.rigid_body_states[:, self.feet_indices][:, 0:len(self.feet_indices),
-                         3:7]  # in world frame
+        self.feet_quat = self.rigid_body_states[:, self.feet_indices][:, 0:len(self.feet_indices), 3:7]  # in world frame
 
-        self.feet_elevation = torch.zeros(self.num_envs, len(self.feet_indices), device=self.device,
-                                          requires_grad=False)
+        self.feet_elevation = torch.zeros(self.num_envs, len(self.feet_indices), device=self.device, requires_grad=False)
 
         for i in range(len(self.feet_indices)):
             feet_forward = quat_apply(self.feet_quat[:, i], self.forward_vec)
@@ -124,6 +126,54 @@ class LeggedRobotFFTAI(LeggedRobot):
 
             self.feet_height[:, i] = foot_height
 
+
+    def _calculate_feet_distance(self):
+        feet_pos_in_world_frame = self.rigid_body_states[:, self.feet_indices][:, 0:len(self.feet_indices), 0:3]  # in world frame
+        base_pos_in_world_frame = self.root_states[:, None, 0:3]  # in world frame, view in [N, 1, 3]
+        feet_pos_to_base_in_world_frame = feet_pos_in_world_frame - base_pos_in_world_frame  # in world frame
+
+        for i in range(len(self.feet_indices)):
+            feet_pos_to_base_in_base_frame = quat_rotate_inverse(
+                self.root_states[:, 3:7],
+                feet_pos_to_base_in_world_frame[:, i]
+            )
+
+            self.feet_pos_to_base[:, i, :] = feet_pos_to_base_in_base_frame
+
+    def _calc_swing_mask(self):
+        cycle_time = 0.9
+        phase = self.episode_length_buf * self.dt / cycle_time
+        sin_pos = torch.sin(2 * torch.pi * phase)
+        sin_pos_l = sin_pos.clone()
+        sin_pos_r = sin_pos.clone()
+        # sin>0: left foot is in stance phase
+        sin_pos_l[sin_pos_l > -0.10] = 0
+        # sin<0: right foot is in stance phase
+        sin_pos_r[sin_pos_r < 0.10] = 0
+        self.swing_clock = torch.stack((-sin_pos_l, sin_pos_r), dim=1)
+        self.swing_clock[self.env_ids_of_stand_command,:] = 0
+        # print(self.swing_clock)
+
+        stance_mask = torch.zeros((self.num_envs, 2), device=self.device)
+        # sin>0: left foot is in stance phase
+        stance_mask[:, 0] = sin_pos >= 0
+        # sin<0: right foot is in stance phase
+        stance_mask[:, 1] = sin_pos < 0
+        stance_mask[torch.abs(sin_pos) < 0.1] = 1
+        stance_mask[self.env_ids_of_stand_command,:] = 1
+        self.stance_mask = stance_mask
+        self.swing_mask = 1 - stance_mask
+        # print(self.stance_mask)
+        # print(self.swing_mask)
+
+    def _calc_feet_height(self):
+        feet_z = self.rigid_body_states[:, self.feet_indices, 2] - 0.05
+        # use this method to identify the robot is stand high or with high feet
+        delta_z = feet_z - self.last_feet_z
+        self.feet_height += delta_z
+        self.last_feet_z = feet_z
+        contact = self.contact_forces[:, self.feet_indices, 2] > 5.
+        self.feet_height *= ~contact
     # ----------------------------------------------
 
     def reset_idx(self, env_ids):

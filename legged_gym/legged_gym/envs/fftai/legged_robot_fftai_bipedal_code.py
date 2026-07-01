@@ -480,17 +480,19 @@ class LeggedRobotFFTAIBipedal(LeggedRobotFFTAI):
         error_stand_still_pos = torch.abs(self.dof_pos[:, self.waist_indices]
                                           - self.default_dof_pos_tenors[:, self.waist_indices])
         error_stand_still_pos = torch.sum(error_stand_still_pos, dim=1)  # dims 2->1
+        # print(error_stand_still_pos)
         reward_stand_still_pos = torch.exp(self.cfg.rewards.sigma_stand_still_dof_pos
                                            * error_stand_still_pos)
+        # print(reward_stand_still_pos)
 
         # ----------------------------
 
-        selector_stand_still = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)  # dims 1
-        selector_stand_still[self.env_ids_of_stand_command] = 1
+        # selector_stand_still = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)  # dims 1
+        # selector_stand_still[self.env_ids_of_stand_command] = 1
 
         # ----------------------------
 
-        reward_stand_still_pos *= selector_stand_still
+        # reward_stand_still_pos *= selector_stand_still
 
         return reward_stand_still_pos
 
@@ -631,6 +633,8 @@ class LeggedRobotFFTAIBipedal(LeggedRobotFFTAI):
         right_foot_pos = quat_rotate_inverse(self.root_states[:, 3:7], right_foot_pos_to_base_in_world_frame)
 
         foot_distance_y = torch.abs(left_foot_pos[:, 1:2] - right_foot_pos[:, 1:2])
+        # print("foot_distance_y",foot_distance_y)
+        # print("self.cfg.rewards.feet_distance_y_too_close",self.cfg.rewards.feet_distance_y_too_close)
 
         error_foot_distance_y_too_close = torch.abs(foot_distance_y - self.cfg.rewards.feet_distance_y_too_close) \
                                           * (foot_distance_y < self.cfg.rewards.feet_distance_y_too_close)
@@ -641,6 +645,36 @@ class LeggedRobotFFTAIBipedal(LeggedRobotFFTAI):
 
         return reward_feet_distance_y_too_close
 
+    def _reward_feet_distance_y_too_far(self):
+        """
+        Penalty for the distance between the feet in the y direction being too far.
+        """
+        left_foot_pos_in_world_frame = self.rigid_body_states[:, self.feet_indices][:, 0, 0:3]
+        right_foot_pos_in_world_frame = self.rigid_body_states[:, self.feet_indices][:, 1, 0:3]
+
+        left_foot_pos_to_base_in_world_frame = left_foot_pos_in_world_frame - self.root_states[:, 0:3]
+        right_foot_pos_to_base_in_world_frame = right_foot_pos_in_world_frame - self.root_states[:, 0:3]
+
+        left_foot_pos = quat_rotate_inverse(self.root_states[:, 3:7], left_foot_pos_to_base_in_world_frame)
+        right_foot_pos = quat_rotate_inverse(self.root_states[:, 3:7], right_foot_pos_to_base_in_world_frame)
+        foot_distance_y = torch.abs(left_foot_pos[:, 1:2] - right_foot_pos[:, 1:2])
+
+        error_foot_distance_y_too_far = torch.abs(foot_distance_y - self.cfg.rewards.feet_distance_y_too_far) \
+                                        * (foot_distance_y > self.cfg.rewards.feet_distance_y_too_far)
+        error_foot_distance_y_too_far = torch.sum(error_foot_distance_y_too_far, dim=1)
+
+        reward_feet_distance_y_too_far = 1 - torch.exp(self.cfg.rewards.sigma_feet_distance_y_too_far
+            * error_foot_distance_y_too_far)
+
+            # 新增：如果横向移动（command[1] > 0.1），将该惩罚乘以 0.2
+        lateral_move_mask = torch.abs(self.commands[:, 1]) > 0.1
+        reward_feet_distance_y_too_far = torch.where(
+            lateral_move_mask,
+            0,
+            reward_feet_distance_y_too_far
+        )
+
+        return reward_feet_distance_y_too_far
     # ----------------------------------------------
 
     def _reward_feet_speed_xy_close_to_ground(self):

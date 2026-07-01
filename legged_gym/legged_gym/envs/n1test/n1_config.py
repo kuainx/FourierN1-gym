@@ -67,15 +67,12 @@ class N1Cfg(LeggedRobotFFTAIBipedalCfg):
             LeggedRobotFFTAIBipedalCfg.asset.hand_name,
             LeggedRobotFFTAIBipedalCfg.asset.end_effector_name,
             LeggedRobotFFTAIBipedalCfg.asset.payload_name,
-            LeggedRobotFFTAIBipedalCfg.asset.hip_name,
-            LeggedRobotFFTAIBipedalCfg.asset.shoulder_name,
-            LeggedRobotFFTAIBipedalCfg.asset.knee_name,
         ]
 
         disable_gravity = False
         collapse_fixed_joints = False  # 显示 fixed joint 的信息
 
-        fix_base_link = False
+        fix_base_link = True
 
         self_collisions = 0  # 1 to disable, 0 to enable...bitwise filter
         replace_cylinder_with_capsule = False
@@ -256,9 +253,9 @@ class N1Cfg(LeggedRobotFFTAIBipedalCfg):
         ]
 
         class ranges(LeggedRobotFFTAIBipedalCfg.commands.ranges):
-            lin_vel_x = [-0.50, 1.0]  # min max [m/s]
-            lin_vel_y = [-0.60, 0.60]  # min max [m/s]
-            ang_vel_yaw = [-0.60, 0.60]  # min max [rad/s]
+            lin_vel_x = [-0.50, 0.75]  # min max [m/s]
+            lin_vel_y = [-0.50, 0.50]  # min max [m/s]
+            ang_vel_yaw = [-1.00, 1.00]  # min max [rad/s]
 
     class control(LeggedRobotFFTAIBipedalCfg.control):
         action_names = [
@@ -427,7 +424,7 @@ class N1Cfg(LeggedRobotFFTAIBipedalCfg):
     class rewards(LeggedRobotFFTAIBipedalCfg.rewards):
         only_positive_rewards = False
 
-        gait_cycle_period = 1.2  # gait cycle period [s]
+        gait_cycle_period = 0.8  # gait cycle period [s]
 
         """
         机器人相关参数信息：
@@ -460,8 +457,6 @@ class N1Cfg(LeggedRobotFFTAIBipedalCfg):
 
         # 脚接触地面的力的限制比例（相对于重力）
         contact_force_limit_ratio = 1.0
-
-        target_feet_height = 0.08
 
         # ---------------------------------------------------------------
 
@@ -558,7 +553,7 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         num_steps_per_env = 64
 
         run_name = ""
-        max_iterations = 20001
+        max_iterations = 5000
         save_interval = 100
 
     class algorithm(LeggedRobotFFTAIBipedalCfgPPO.algorithm):
@@ -576,37 +571,13 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         # storage class
         storage_class = "RolloutStorage"
 
-    # class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-    #     class_name = "ActorCriticMLP"
-
-    #     # policy params
-    #     actor_hidden_dims = [1024, 512, 256, 128]
-    #     critic_hidden_dims = [1024, 512, 256, 128]
-    #     activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
-    #     init_weights = False
-
-    #     fixed_std = False
-    #     init_noise_std = [0.2] * N1Cfg.env.num_actions
-
-    #     decay_std = False
-    #     decay_ratio = 1 - 2.0e-6
-    #     decay_std_min = 0.1
     class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-        class_name = "ActorCriticMamba"  # 切换为 Mamba 版本
-
-        # Mamba 参数
-        mamba_d_model = 128          # Mamba 隐藏维度
-        mamba_d_state = 16           # SSM 状态维度
-        mamba_d_conv = 4             # 卷积宽度
-        mamba_expand = 2             # 扩展因子
-        mamba_n_layers = 2           # Mamba 层数
-        mamba_headdim = 32           # d_model * expand / headdim = multiple of 8
-        seq_len = 20                 # 序列长度
+        class_name = "ActorCriticMLP"
 
         # policy params
-        actor_hidden_dims = [256, 128]      # 可适当减小，因为 Mamba 已提取特征
-        critic_hidden_dims = [256, 128]
-        activation = "elu"
+        actor_hidden_dims = [1024, 512, 256, 128]
+        critic_hidden_dims = [1024, 512, 256, 128]
+        activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
         init_weights = False
 
         fixed_std = False

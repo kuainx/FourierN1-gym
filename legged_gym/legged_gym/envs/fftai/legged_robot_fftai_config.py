@@ -34,15 +34,15 @@ class LeggedRobotFFTAICfg(LeggedRobotCfg):
         sigma_collision = -1.0 * torch.e
 
         sigma_stand_still = -1.0 * torch.e
-        sigma_stand_still_dof_pos = -1.0 * torch.e
+        sigma_stand_still_dof_pos = -5 * torch.e
 
-        sigma_cmd_diff_base_lin_vel_x = -1.0 * torch.e * (1.0 / 0.50)
-        sigma_cmd_diff_base_lin_vel_y = -1.0 * torch.e * (1.0 / 1.00)
-        sigma_cmd_diff_base_ang_vel_yaw = -1.0 * torch.e * (1.0 / 3.00)
+        sigma_cmd_diff_base_lin_vel_x = -1.0 * torch.e * (1.0 / 0.20)
+        sigma_cmd_diff_base_lin_vel_y = -1.0 * torch.e * (1.0 / 0.20)
+        sigma_cmd_diff_base_ang_vel_yaw = -1.0 * torch.e * (1.0 / 0.5)
 
         sigma_base_lin_vel_z = -1.0 * torch.e
 
-        sigma_base_height_offset = -10.0 * torch.e
+        sigma_base_height_offset = -20.0 * torch.e
         sigma_base_orient_offset = -1.0 * torch.e
 
         sigma_base_flat_orient = -5.0 * torch.e

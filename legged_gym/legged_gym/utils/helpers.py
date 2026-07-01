@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -105,7 +105,7 @@ def parse_sim_params(args, cfg):
     return sim_params
 
 
-def get_load_path(root, load_run=-1, checkpoint=-1):
+def get_load_path(root, load_run=-1, checkpoint=-1, play=False):
     try:
         runs = os.listdir(root)
         # TODO sort by date to handle change of month
@@ -116,6 +116,12 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
         raise ValueError("No runs in this directory: " + root)
     if load_run == -1:
         load_run = last_run
+        if play:
+            runs_f = list(filter(lambda x: play in x, runs))
+            if len(runs_f) > 0:
+                load_run = os.path.join(root, runs_f[-1])
+            else:
+                print("WARNING - Could not find run:" + play)
     else:
         load_run = os.path.join(root, load_run)
 
@@ -186,17 +192,22 @@ def get_args():
 
 
 def export_policy_as_jit(actor_critic, path):
-    if hasattr(actor_critic, 'memory_a'):
-        # assumes LSTM: TODO add GRU
-        exporter = PolicyExporterLSTM(actor_critic)
-        exporter.export(path)
+    # actor_critic.to('cuda')
+    os.makedirs(path, exist_ok=True)
+    path = os.path.join(path, 'policy_jit.pt')
+    actor_critic.save_jit(path)
 
-    else:
-        os.makedirs(path, exist_ok=True)
-        path = os.path.join(path, 'policy_jit.pt')
-        model = copy.deepcopy(actor_critic.actor).to('cpu')
-        traced_script_module = torch.jit.script(model)
-        traced_script_module.save(path)
+    # if hasattr(actor_critic, 'memory_a'):
+    #     # assumes LSTM: TODO add GRU
+    #     exporter = PolicyExporterLSTM(actor_critic)
+    #     exporter.export(path)
+
+    # else:
+    #     os.makedirs(path, exist_ok=True)
+    #     path = os.path.join(path, 'policy_jit.pt')
+    #     model = copy.deepcopy(actor_critic.actor).to('cpu')
+    #     traced_script_module = torch.jit.script(model)
+    #     traced_script_module.save(path)
 
     return path
 
