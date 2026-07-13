@@ -41,4 +41,3 @@ import legged_gym.envs.fftai
 
 # N1
 import legged_gym.envs.n1
-import legged_gym.envs.n1run

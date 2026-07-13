@@ -286,7 +286,7 @@ class Actor(nn.Module):
         nn.init.constant_(self.fc_mu[0].bias, 0.0)
 
         noise_scales = (
-            torch.rand(num_envs, 1, device=device) * (std_max - std_min) + std_min
+            torch.rand(num_envs, n_act, device=device) * (std_max - std_min) + std_min
         )
         self.register_buffer("noise_scales", noise_scales)
 
@@ -305,16 +305,13 @@ class Actor(nn.Module):
     def explore(
         self, obs: torch.Tensor, dones: torch.Tensor = None, deterministic: bool = False
     ) -> torch.Tensor:
-        # If dones is provided, resample noise for environments that are done
+        # Resample per-joint noise scales at episode boundaries
         if dones is not None and dones.sum() > 0:
-            # Generate new noise scales for done environments (one per environment)
             new_scales = (
-                torch.rand(self.n_envs, 1, device=obs.device)
+                torch.rand(self.n_envs, self.n_act, device=obs.device)
                 * (self.std_max - self.std_min)
                 + self.std_min
             )
-
-            # Update only the noise scales for environments that are done
             dones_view = dones.view(-1, 1) > 0
             self.noise_scales.copy_(
                 torch.where(dones_view, new_scales, self.noise_scales)
@@ -324,6 +321,7 @@ class Actor(nn.Module):
         if deterministic:
             return act
 
+        # Per-step independent noise, per-joint scales
         noise = torch.randn_like(act) * self.noise_scales
         return act + noise
 

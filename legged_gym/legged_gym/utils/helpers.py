@@ -192,22 +192,14 @@ def get_args():
 
 
 def export_policy_as_jit(actor_critic, path):
-    # actor_critic.to('cuda')
     os.makedirs(path, exist_ok=True)
     path = os.path.join(path, 'policy_jit.pt')
-    actor_critic.save_jit(path)
-
-    # if hasattr(actor_critic, 'memory_a'):
-    #     # assumes LSTM: TODO add GRU
-    #     exporter = PolicyExporterLSTM(actor_critic)
-    #     exporter.export(path)
-
-    # else:
-    #     os.makedirs(path, exist_ok=True)
-    #     path = os.path.join(path, 'policy_jit.pt')
-    #     model = copy.deepcopy(actor_critic.actor).to('cpu')
-    #     traced_script_module = torch.jit.script(model)
-    #     traced_script_module.save(path)
+    if hasattr(actor_critic, 'save_jit'):
+        actor_critic.save_jit(path)
+    else:
+        model = copy.deepcopy(actor_critic.actor).to('cpu')
+        traced_script_module = torch.jit.script(model)
+        traced_script_module.save(path)
 
     return path
 

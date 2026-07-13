@@ -22,6 +22,7 @@ class SimpleReplayBuffer(nn.Module):
         n_steps: int = 1,
         gamma: float = 0.99,
         device=None,
+        cpu_buffer: bool = False,
     ):
         """
         A simple replay buffer that stores transitions in a circular buffer.
@@ -30,6 +31,9 @@ class SimpleReplayBuffer(nn.Module):
         When playground_mode=True, critic_observations are treated as a concatenation of
         regular observations and privileged observations, and only the privileged part is stored
         to save memory.
+
+        When cpu_buffer=True, buffer tensors are stored on CPU to save GPU memory.
+        Data is automatically moved CPU↔GPU in extend()/sample().
 
         TODO (Younggyo): Refactor to split this into SimpleReplayBuffer and NStepReplayBuffer
         """
@@ -45,22 +49,24 @@ class SimpleReplayBuffer(nn.Module):
         self.gamma = gamma
         self.n_steps = n_steps
         self.device = device
+        self.cpu_buffer = cpu_buffer
+        self.buffer_device = torch.device("cpu") if cpu_buffer else device
 
         self.observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
+            (n_env, buffer_size, n_obs), device=self.buffer_device, dtype=torch.float
         )
         self.actions = torch.zeros(
-            (n_env, buffer_size, n_act), device=device, dtype=torch.float
+            (n_env, buffer_size, n_act), device=self.buffer_device, dtype=torch.float
         )
         self.rewards = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.float
+            (n_env, buffer_size), device=self.buffer_device, dtype=torch.float
         )
-        self.dones = torch.zeros((n_env, buffer_size), device=device, dtype=torch.long)
+        self.dones = torch.zeros((n_env, buffer_size), device=self.buffer_device, dtype=torch.long)
         self.truncations = torch.zeros(
-            (n_env, buffer_size), device=device, dtype=torch.long
+            (n_env, buffer_size), device=self.buffer_device, dtype=torch.long
         )
         self.next_observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=device, dtype=torch.float
+            (n_env, buffer_size, n_obs), device=self.buffer_device, dtype=torch.float
         )
         if asymmetric_obs:
             if self.playground_mode:
@@ -68,21 +74,21 @@ class SimpleReplayBuffer(nn.Module):
                 self.privileged_obs_size = n_critic_obs - n_obs
                 self.privileged_observations = torch.zeros(
                     (n_env, buffer_size, self.privileged_obs_size),
-                    device=device,
+                    device=self.buffer_device,
                     dtype=torch.float,
                 )
                 self.next_privileged_observations = torch.zeros(
                     (n_env, buffer_size, self.privileged_obs_size),
-                    device=device,
+                    device=self.buffer_device,
                     dtype=torch.float,
                 )
             else:
                 # Store full critic observations
                 self.critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                    (n_env, buffer_size, n_critic_obs), device=self.buffer_device, dtype=torch.float
                 )
                 self.next_critic_observations = torch.zeros(
-                    (n_env, buffer_size, n_critic_obs), device=device, dtype=torch.float
+                    (n_env, buffer_size, n_critic_obs), device=self.buffer_device, dtype=torch.float
                 )
         self.ptr = 0
 
@@ -91,12 +97,12 @@ class SimpleReplayBuffer(nn.Module):
         self,
         tensor_dict: TensorDict,
     ):
-        observations = tensor_dict["observations"]
-        actions = tensor_dict["actions"]
-        rewards = tensor_dict["next"]["rewards"]
-        dones = tensor_dict["next"]["dones"]
-        truncations = tensor_dict["next"]["truncations"]
-        next_observations = tensor_dict["next"]["observations"]
+        observations = tensor_dict["observations"].to(self.buffer_device)
+        actions = tensor_dict["actions"].to(self.buffer_device)
+        rewards = tensor_dict["next"]["rewards"].to(self.buffer_device)
+        dones = tensor_dict["next"]["dones"].to(self.buffer_device)
+        truncations = tensor_dict["next"]["truncations"].to(self.buffer_device)
+        next_observations = tensor_dict["next"]["observations"].to(self.buffer_device)
 
         ptr = self.ptr % self.buffer_size
         self.observations[:, ptr] = observations
@@ -106,8 +112,8 @@ class SimpleReplayBuffer(nn.Module):
         self.truncations[:, ptr] = truncations
         self.next_observations[:, ptr] = next_observations
         if self.asymmetric_obs:
-            critic_observations = tensor_dict["critic_observations"]
-            next_critic_observations = tensor_dict["next"]["critic_observations"]
+            critic_observations = tensor_dict["critic_observations"].to(self.buffer_device)
+            next_critic_observations = tensor_dict["next"]["critic_observations"].to(self.buffer_device)
 
             if self.playground_mode:
                 # Extract and store only the privileged part
@@ -130,7 +136,7 @@ class SimpleReplayBuffer(nn.Module):
                 0,
                 min(self.buffer_size, self.ptr),
                 (self.n_env, batch_size),
-                device=self.device,
+                device=self.buffer_device,
             )
             obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
@@ -201,7 +207,7 @@ class SimpleReplayBuffer(nn.Module):
                     0,
                     self.buffer_size,
                     (self.n_env, batch_size),
-                    device=self.device,
+                    device=self.buffer_device,
                 )
             else:
                 # Buffer not full - ensure n-step sequence doesn't exceed valid data
@@ -210,7 +216,7 @@ class SimpleReplayBuffer(nn.Module):
                     0,
                     max_start_idx,
                     (self.n_env, batch_size),
-                    device=self.device,
+                    device=self.buffer_device,
                 )
             obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
@@ -247,7 +253,7 @@ class SimpleReplayBuffer(nn.Module):
 
             # Create sequential indices for each sample
             # This creates a [n_env, batch_size, n_step] tensor of indices
-            seq_offsets = torch.arange(self.n_steps, device=self.device).view(1, 1, -1)
+            seq_offsets = torch.arange(self.n_steps, device=self.buffer_device).view(1, 1, -1)
             all_indices = (
                 indices.unsqueeze(-1) + seq_offsets
             ) % self.buffer_size  # [n_env, batch_size, n_step]
@@ -278,7 +284,7 @@ class SimpleReplayBuffer(nn.Module):
 
             # Create discount factors
             discounts = torch.pow(
-                self.gamma, torch.arange(self.n_steps, device=self.device)
+                self.gamma, torch.arange(self.n_steps, device=self.buffer_device)
             )  # [n_steps]
 
             # Apply masks and discounts to rewards
@@ -396,7 +402,7 @@ class SimpleReplayBuffer(nn.Module):
         if self.n_steps > 1 and self.ptr >= self.buffer_size:
             # Roll back the truncation flags introduced for safe sampling
             self.truncations[:, current_pos - 1] = curr_truncations
-        return out
+        return out.to(self.device)
 
 
 class EmpiricalNormalization(nn.Module):

@@ -79,7 +79,8 @@ def play(args):
             train_cfg.runner.experiment_name,
             "exported",
         )
-        path = export_policy_as_jit(ppo_runner.algorithm.actor_critic, path)
+        model = ppo_runner.algorithm.actor_critic if hasattr(ppo_runner, 'algorithm') else ppo_runner
+        path = export_policy_as_jit(model, path)
         print(
             f"\033[93m"
             f"EXPORT_POLICY: "
@@ -154,7 +155,7 @@ def play(args):
             logger.plot_states()
 
         if 0 < i < stop_rew_log:
-            if infos["episode"]:
+            if infos.get("episode"):
                 num_episodes = torch.sum(env.reset_buf).item()
                 if num_episodes > 0:
                     logger.log_rewards(infos["episode"], num_episodes)
