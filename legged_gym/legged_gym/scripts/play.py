@@ -106,8 +106,8 @@ def play(args):
     for i in range(10 * int(env.max_episode_length)):
         actions = policy(obs.detach())
         # actions = env.ref_action
-        env.commands[:, 0] = 0.0
-        env.commands[:, 1] = 0.3
+        env.commands[:, 0] = 0.5
+        env.commands[:, 1] = 0.0
         env.commands[:, 2] = 0.0
         # time.sleep(0.01)
         obs, _, rews, dones, infos = env.step(actions.detach())

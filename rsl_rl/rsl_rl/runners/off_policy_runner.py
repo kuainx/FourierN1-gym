@@ -23,6 +23,7 @@ if _FASTTD3_ROOT not in sys.path:
     sys.path.insert(0, _FASTTD3_ROOT)
 
 from fast_td3.fast_td3 import Actor, Critic
+from fast_td3.fast_td3_deploy import Policy
 from fast_td3.fast_td3_utils import (
     EmpiricalNormalization,
     SimpleReplayBuffer,
@@ -787,6 +788,7 @@ class OffPolicyRunner:
         Returns a callable that takes obs and returns actions without exploration noise.
         """
         self.actor.eval()
+        self.obs_normalizer.eval()
         if device is not None:
             self.actor.to(device)
 
@@ -796,6 +798,34 @@ class OffPolicyRunner:
                 return self.actor(norm_obs)
 
         return _policy
+
+    def save_jit(self, path):
+        """Export actor + obs_normalizer as a JIT-scripted Policy for deployment."""
+        # Infer dimensions from actor network
+        n_obs = self.actor.net[0].in_features
+        n_act = self.actor.fc_mu[0].out_features
+
+        args = {
+            "num_envs": 1,
+            "init_scale": self.fast_td3_cfg.get("init_scale", 0.01),
+            "actor_hidden_dim": self.fast_td3_cfg.get("actor_hidden_dim", 512),
+        }
+        agent = self.fast_td3_cfg.get("agent", "fasttd3")
+
+        policy = Policy(n_obs=n_obs, n_act=n_act, args=args, agent=agent)
+        policy.actor.load_state_dict(self.actor.state_dict())
+
+        if isinstance(self.obs_normalizer, EmpiricalNormalization):
+            policy.obs_normalizer.load_state_dict(
+                self.obs_normalizer.state_dict()
+            )
+        else:
+            policy.obs_normalizer = nn.Identity()
+
+        policy = policy.cpu().eval()
+        scripted = torch.jit.script(policy)
+        scripted.save(path)
+        print(f"Saved JIT policy to {path}")
 
     def train_mode(self):
         self.actor.train()
