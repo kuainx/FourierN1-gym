@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import time
@@ -22,7 +23,7 @@ _FASTTD3_ROOT = os.path.abspath(_FASTTD3_ROOT)
 if _FASTTD3_ROOT not in sys.path:
     sys.path.insert(0, _FASTTD3_ROOT)
 
-from fast_td3.fast_td3 import Actor, Critic
+from fast_td3.fast_td3 import Actor, Critic, MambaActor
 from fast_td3.fast_td3_deploy import Policy
 from fast_td3.fast_td3_utils import (
     EmpiricalNormalization,
@@ -106,20 +107,47 @@ class OffPolicyRunner:
             self.critic_obs_normalizer = nn.Identity()
 
         # --- Actor ---
-        actor_kwargs = dict(
-            n_obs=n_obs,
-            n_act=n_act,
-            num_envs=num_envs,
-            init_scale=self.fast_td3_cfg.get("init_scale", 0.01),
-            hidden_dim=self.fast_td3_cfg.get("actor_hidden_dim", 512),
-            std_min=self.fast_td3_cfg.get("std_min", 0.001),
-            std_max=self.fast_td3_cfg.get("std_max", 0.4),
-            sim_type=self.fast_td3_cfg.get("sim_type", ""),
-            sim_dimension=self.fast_td3_cfg.get("sim_dimension", 64),
-            seq_len=self.fast_td3_cfg.get("actor_seq_len", 8),
-            device=device,
-        )
-        self.actor = Actor(**actor_kwargs)
+        self.use_mamba = self.fast_td3_cfg.get("use_mamba", False)
+
+        if self.use_mamba:
+            # MambaActor: Mamba-2 backbone for temporal sequence modeling
+            num_stack = env.cfg.env.num_stack if hasattr(env.cfg, "env") else 1
+            single_obs_dim = env.num_obs  # single-step obs dim (before stacking)
+            actor_kwargs = dict(
+                n_obs=n_obs,
+                n_act=n_act,
+                num_envs=num_envs,
+                init_scale=self.fast_td3_cfg.get("init_scale", 0.01),
+                hidden_dim=self.fast_td3_cfg.get("actor_hidden_dim", 512),
+                num_stack=num_stack,
+                obs_dim=single_obs_dim,
+                std_min=self.fast_td3_cfg.get("std_min", 0.001),
+                std_max=self.fast_td3_cfg.get("std_max", 0.4),
+                mamba_d_model=self.fast_td3_cfg.get("mamba_d_model", 128),
+                mamba_d_state=self.fast_td3_cfg.get("mamba_d_state", 16),
+                mamba_d_conv=self.fast_td3_cfg.get("mamba_d_conv", 4),
+                mamba_expand=self.fast_td3_cfg.get("mamba_expand", 2),
+                mamba_headdim=self.fast_td3_cfg.get("mamba_headdim", 64),
+                mamba_n_layers=self.fast_td3_cfg.get("mamba_n_layers", 2),
+                device=device,
+            )
+            self.actor = MambaActor(**actor_kwargs)
+            print("  Using MambaActor (Mamba-2 backbone)")
+        else:
+            actor_kwargs = dict(
+                n_obs=n_obs,
+                n_act=n_act,
+                num_envs=num_envs,
+                init_scale=self.fast_td3_cfg.get("init_scale", 0.01),
+                hidden_dim=self.fast_td3_cfg.get("actor_hidden_dim", 512),
+                std_min=self.fast_td3_cfg.get("std_min", 0.001),
+                std_max=self.fast_td3_cfg.get("std_max", 0.4),
+                sim_type=self.fast_td3_cfg.get("sim_type", ""),
+                sim_dimension=self.fast_td3_cfg.get("sim_dimension", 64),
+                seq_len=self.fast_td3_cfg.get("actor_seq_len", 8),
+                device=device,
+            )
+            self.actor = Actor(**actor_kwargs)
 
         # --- Critic ---
         critic_kwargs = dict(
@@ -188,6 +216,7 @@ class OffPolicyRunner:
             gamma=self.fast_td3_cfg.get("gamma", 0.99),
             device=device,
             cpu_buffer=self.fast_td3_cfg.get("cpu_buffer", False),
+            recent_ratio=self.fast_td3_cfg.get("recent_ratio", 0.0),
         )
 
         # --- AMP setup ---
@@ -800,8 +829,14 @@ class OffPolicyRunner:
         return _policy
 
     def save_jit(self, path):
-        """Export actor + obs_normalizer as a JIT-scripted Policy for deployment."""
-        # Infer dimensions from actor network
+        """Export actor + obs_normalizer as a JIT-traced Policy for deployment."""
+        if self.use_mamba:
+            self._save_jit_mamba(path)
+        else:
+            self._save_jit_mlp(path)
+
+    def _save_jit_mlp(self, path):
+        """Export MLP actor as JIT-scripted Policy."""
         n_obs = self.actor.net[0].in_features
         n_act = self.actor.fc_mu[0].out_features
 
@@ -825,6 +860,73 @@ class OffPolicyRunner:
         policy = policy.cpu().eval()
         scripted = torch.jit.script(policy)
         scripted.save(path)
+        print(f"Saved JIT policy to {path}")
+
+    def _save_jit_mamba(self, path):
+        """Export MambaActor as JIT-traced Policy (pure PyTorch, no Triton)."""
+        from rsl_rl.modules.actor_critic_mamba import Mamba2EncoderJit
+
+        seq_len = self.actor.seq_len
+        obs_dim = self.actor.obs_dim
+        n_act = self.actor.n_act
+
+        # Build JIT-compatible encoder (pure PyTorch SSM, no Triton kernels)
+        jit_encoder = Mamba2EncoderJit(self.actor.mamba_encoder)
+
+        # Wrapper: reshape → mamba encoder → fc_head → fc_mu → tanh
+        class MambaActorJit(nn.Module):
+            def __init__(self, encoder, fc_head, fc_mu, seq_len, obs_dim):
+                super().__init__()
+                self.encoder = encoder
+                self.fc_head = fc_head
+                self.fc_mu = fc_mu
+                self.seq_len = seq_len
+                self.obs_dim = obs_dim
+
+            def forward(self, obs_flat):
+                batch_size = obs_flat.shape[0]
+                obs_seq = obs_flat.view(batch_size, self.seq_len, self.obs_dim)
+                h = self.encoder(obs_seq)
+                x = self.fc_head(h)
+                return self.fc_mu(x)
+
+        actor_jit = MambaActorJit(
+            encoder=jit_encoder,
+            fc_head=self.actor.fc_head,
+            fc_mu=self.actor.fc_mu,
+            seq_len=seq_len,
+            obs_dim=obs_dim,
+        )
+
+        # Build full Policy with obs_normalizer
+        class MambaPolicyJit(nn.Module):
+            def __init__(self, obs_normalizer, actor, n_obs):
+                super().__init__()
+                self.obs_normalizer = obs_normalizer
+                self.actor = actor
+                self.n_obs = n_obs
+
+            def forward(self, obs):
+                return self.actor(self.obs_normalizer(obs))
+
+        if isinstance(self.obs_normalizer, EmpiricalNormalization):
+            obs_norm = copy.deepcopy(self.obs_normalizer)
+        else:
+            obs_norm = nn.Identity()
+
+        policy = MambaPolicyJit(
+            obs_normalizer=obs_norm,
+            actor=actor_jit,
+            n_obs=seq_len * obs_dim,
+        )
+
+        # Deep copy to CPU to avoid affecting the CUDA model
+        policy = copy.deepcopy(policy).cpu().eval()
+
+        # Trace with dummy input
+        dummy = torch.zeros(1, seq_len * obs_dim)
+        traced = torch.jit.trace(policy, dummy)
+        traced.save(path)
         print(f"Saved JIT policy to {path}")
 
     def train_mode(self):

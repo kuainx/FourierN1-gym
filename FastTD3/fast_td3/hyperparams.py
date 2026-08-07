@@ -134,6 +134,12 @@ class BaseArgs:
     actor_seq_len: int = 8
     """the number of simplices used in the actor head"""
 
+    # Mirror loss parameters
+    mirror_coef: float = 0.0
+    """the coefficient of the mirror loss (0.0 to disable)"""
+    enable_mirror: bool = False
+    """whether to enable mirror loss for symmetric learning"""
+
 def get_args():
     """
     Parse command-line arguments and return the appropriate Args instance based on env_name.

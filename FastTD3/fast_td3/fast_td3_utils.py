@@ -23,6 +23,7 @@ class SimpleReplayBuffer(nn.Module):
         gamma: float = 0.99,
         device=None,
         cpu_buffer: bool = False,
+        recent_ratio: float = 0.0,  # 0.0 = uniform, >0 = sample from recent portion
     ):
         """
         A simple replay buffer that stores transitions in a circular buffer.
@@ -51,6 +52,7 @@ class SimpleReplayBuffer(nn.Module):
         self.device = device
         self.cpu_buffer = cpu_buffer
         self.buffer_device = torch.device("cpu") if cpu_buffer else device
+        self.recent_ratio = recent_ratio  # fraction of buffer to sample from (recent-first)
 
         self.observations = torch.zeros(
             (n_env, buffer_size, n_obs), device=self.buffer_device, dtype=torch.float
@@ -132,12 +134,17 @@ class SimpleReplayBuffer(nn.Module):
         # we will sample n_env * batch_size transitions
 
         if self.n_steps == 1:
-            indices = torch.randint(
-                0,
-                min(self.buffer_size, self.ptr),
-                (self.n_env, batch_size),
-                device=self.buffer_device,
-            )
+            filled = min(self.buffer_size, self.ptr)
+            if self.recent_ratio > 0:
+                # Sample from recent portion of buffer
+                start = int(filled * (1.0 - self.recent_ratio))
+                indices = torch.randint(
+                    start, filled, (self.n_env, batch_size), device=self.buffer_device
+                )
+            else:
+                indices = torch.randint(
+                    0, filled, (self.n_env, batch_size), device=self.buffer_device
+                )
             obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
             observations = torch.gather(self.observations, 1, obs_indices).reshape(

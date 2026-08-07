@@ -1,6 +1,16 @@
+import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Add rsl_rl modules path for Mamba2Encoder import
+_RSL_RL_MODULES = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "rsl_rl", "rsl_rl", "modules")
+)
+if _RSL_RL_MODULES not in sys.path:
+    sys.path.insert(0, _RSL_RL_MODULES)
 
 
 VALID_SIM_TYPES = {"", "sim_actor", "sim_critic", "sim_both"}
@@ -376,3 +386,115 @@ class MultiTaskCritic(Critic):
         task_embeddings = self.task_embedding(task_indices)
         obs = torch.cat([obs[..., : -self.num_tasks], task_embeddings], dim=-1)
         return super().projection(obs, actions, rewards, bootstrap, discount)
+
+
+class MambaActor(nn.Module):
+    """FastTD3 Actor with Mamba-2 backbone for temporal sequence modeling.
+
+    Reuses Mamba2Encoder from PPO-Mamba. The environment's frame-stacked obs
+    (batch, seq_len * obs_dim) is reshaped into a sequence and processed by
+    Mamba-2 in parallel during training, then recursively during inference.
+    """
+
+    def __init__(
+        self,
+        n_obs: int,
+        n_act: int,
+        num_envs: int,
+        init_scale: float,
+        hidden_dim: int,
+        num_stack: int,
+        obs_dim: int,
+        std_min: float = 0.05,
+        std_max: float = 0.8,
+        mamba_d_model: int = 128,
+        mamba_d_state: int = 16,
+        mamba_d_conv: int = 4,
+        mamba_expand: int = 2,
+        mamba_headdim: int = 64,
+        mamba_n_layers: int = 2,
+        device: torch.device = None,
+    ):
+        super().__init__()
+        from mamba_encoder import Mamba2Encoder
+
+        self.n_act = n_act
+        self.n_envs = num_envs
+        self.seq_len = num_stack
+        self.obs_dim = obs_dim
+        self.device = device
+
+        # Mamba-2 encoder: processes (batch, seq_len, obs_dim) → (batch, d_model)
+        self.mamba_encoder = Mamba2Encoder(
+            d_input=obs_dim,
+            d_model=mamba_d_model,
+            d_state=mamba_d_state,
+            d_conv=mamba_d_conv,
+            expand=mamba_expand,
+            headdim=mamba_headdim,
+            n_layers=mamba_n_layers,
+        )
+        if device is not None:
+            self.mamba_encoder.to(device)
+
+        # MLP head: aligned with PPO-Mamba actor_hidden_dims=[256, 256, 128, 64]
+        self.fc_head = nn.Sequential(
+            nn.Linear(mamba_d_model, 256, device=device),  # 128 → 256
+            nn.ReLU(),
+            nn.Linear(256, 256, device=device),            # 256 → 256
+            nn.ReLU(),
+            nn.Linear(256, 128, device=device),            # 256 → 128
+            nn.ReLU(),
+            nn.Linear(128, 64, device=device),             # 128 → 64
+            nn.ReLU(),
+        )
+        self.fc_mu = nn.Sequential(
+            nn.Linear(64, n_act, device=device),           # 64 → 13
+            nn.Tanh(),
+        )
+        nn.init.normal_(self.fc_mu[0].weight, 0.0, init_scale)
+        nn.init.constant_(self.fc_mu[0].bias, 0.0)
+
+        # Per-joint exploration noise (same mechanism as original Actor)
+        noise_scales = (
+            torch.rand(num_envs, n_act, device=device) * (std_max - std_min) + std_min
+        )
+        self.register_buffer("noise_scales", noise_scales)
+        self.register_buffer("std_min", torch.as_tensor(std_min, device=device))
+        self.register_buffer("std_max", torch.as_tensor(std_max, device=device))
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Forward pass: (batch, seq_len * obs_dim) → (batch, n_act)."""
+        batch_size = obs.shape[0]
+        # Reshape flat stacked obs into sequence: (B, L*D) → (B, L, D)
+        obs_seq = obs.view(batch_size, self.seq_len, self.obs_dim)
+        # Mamba-2 encoding (parallel scan during training)
+        encoded = self.mamba_encoder(obs_seq)
+        # MLP head → action
+        x = self.fc_head(encoded)
+        action = self.fc_mu(x)
+        return action
+
+    def explore(
+        self, obs: torch.Tensor, dones: torch.Tensor = None, deterministic: bool = False
+    ) -> torch.Tensor:
+        """Generate action with exploration noise. Same interface as Actor.explore."""
+        # Resample per-joint noise scales at episode boundaries
+        if dones is not None and dones.sum() > 0:
+            new_scales = (
+                torch.rand(self.n_envs, self.n_act, device=obs.device)
+                * (self.std_max - self.std_min)
+                + self.std_min
+            )
+            dones_view = dones.view(-1, 1) > 0
+            self.noise_scales.copy_(
+                torch.where(dones_view, new_scales, self.noise_scales)
+            )
+
+        act = self(obs)
+        if deterministic:
+            return act
+
+        # Per-step independent noise, per-joint scales
+        noise = torch.randn_like(act) * self.noise_scales
+        return act + noise

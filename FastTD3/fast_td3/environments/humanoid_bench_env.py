@@ -126,3 +126,21 @@ class HumanoidBenchEnv:
         infos["time_outs"] = truncateds
 
         return observations, rewards, dones, infos
+
+    def get_mirror_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Returns mirror observations for symmetric learning.
+        HumanoidBench environments don't have native mirror support,
+        so we return observations unchanged (identity mapping).
+        """
+        # Default: identity mapping (no mirroring)
+        return observations
+
+    def get_mirror_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Returns mirror actions for symmetric learning.
+        HumanoidBench environments don't have native mirror support,
+        so we return actions unchanged (identity mapping).
+        """
+        # Default: identity mapping (no mirroring)
+        return actions

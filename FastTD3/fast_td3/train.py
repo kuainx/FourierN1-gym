@@ -493,20 +493,38 @@ def main():
         with autocast(
             device_type=amp_device_type, dtype=amp_dtype, enabled=amp_enabled
         ):
+            observations = data["observations"]
             critic_observations = (
                 data["critic_observations"]
                 if envs.asymmetric_obs
-                else data["observations"]
+                else observations
             )
 
-            qf1, qf2 = qnet(critic_observations, actor(data["observations"]))
+            # Compute current actions
+            current_actions = actor(observations)
+
+            # Mirror loss computation
+            mirror_loss = torch.tensor(0.0, device=device)
+            if args.enable_mirror and args.mirror_coef > 0:
+                # Check if environment supports mirror operations
+                if hasattr(envs, 'get_mirror_observations') and hasattr(envs, 'get_mirror_actions'):
+                    # Get mirror observations
+                    mirror_obs = envs.get_mirror_observations(observations)
+                    # Get actions for mirror observations
+                    mirror_actions = actor(mirror_obs)
+                    # Get mirror of mirror actions (should match original actions)
+                    target_actions = envs.get_mirror_actions(mirror_actions)
+                    # Compute mirror loss (MSE between original and mirror-consistent actions)
+                    mirror_loss = F.mse_loss(current_actions, target_actions) * args.mirror_coef
+
+            qf1, qf2 = qnet(critic_observations, current_actions)
             qf1_value = qnet.get_value(F.softmax(qf1, dim=1))
             qf2_value = qnet.get_value(F.softmax(qf2, dim=1))
             if args.use_cdq:
                 qf_value = torch.minimum(qf1_value, qf2_value)
             else:
                 qf_value = (qf1_value + qf2_value) / 2.0
-            actor_loss = -qf_value.mean()
+            actor_loss = -qf_value.mean() + mirror_loss
 
         actor_optimizer.zero_grad(set_to_none=True)
         scaler.scale(actor_loss).backward()
@@ -522,6 +540,7 @@ def main():
         scaler.update()
         logs_dict["actor_grad_norm"] = actor_grad_norm.detach()
         logs_dict["actor_loss"] = actor_loss.detach()
+        logs_dict["mirror_loss"] = mirror_loss.detach()
         return logs_dict
 
     @torch.no_grad()
@@ -554,6 +573,14 @@ def main():
         critic_obs = torch.as_tensor(critic_obs, device=device, dtype=torch.float)
     else:
         obs = envs.reset()
+
+    # Check mirror support at init time
+    if args.enable_mirror and args.mirror_coef > 0:
+        if hasattr(envs, 'get_mirror_observations') and hasattr(envs, 'get_mirror_actions'):
+            print(f"Mirror loss enabled with coef={args.mirror_coef}")
+        else:
+            print("Warning: Environment doesn't support mirror operations. Disabling mirror loss.")
+            args.enable_mirror = False
     if args.checkpoint_path:
         # Load checkpoint if specified
         torch_checkpoint = torch.load(
@@ -688,6 +715,7 @@ def main():
                         "critic_grad_norm": logs_dict["critic_grad_norm"].mean(),
                         "env_rewards": rewards.mean(),
                         "buffer_rewards": raw_rewards.mean(),
+                        "mirror_loss": logs_dict["mirror_loss"].mean(),
                     }
 
                     if args.eval_interval > 0 and global_step % args.eval_interval == 0:

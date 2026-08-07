@@ -81,3 +81,25 @@ class IsaacLabEnv:
         raise NotImplementedError(
             "We don't support rendering for IsaacLab environments"
         )
+
+    def get_mirror_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        """
+        Returns mirror observations for symmetric learning.
+        If the underlying environment has mirror functionality, use it.
+        Otherwise, return observations unchanged (identity mapping).
+        """
+        if hasattr(self.envs.unwrapped, 'get_mirror_observations'):
+            return self.envs.unwrapped.get_mirror_observations(observations)
+        # Default: identity mapping (no mirroring)
+        return observations
+
+    def get_mirror_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Returns mirror actions for symmetric learning.
+        If the underlying environment has mirror functionality, use it.
+        Otherwise, return actions unchanged (identity mapping).
+        """
+        if hasattr(self.envs.unwrapped, 'get_mirror_actions'):
+            return self.envs.unwrapped.get_mirror_actions(actions)
+        # Default: identity mapping (no mirroring)
+        return actions

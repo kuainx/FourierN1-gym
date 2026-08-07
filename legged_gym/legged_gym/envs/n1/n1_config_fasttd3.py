@@ -19,7 +19,7 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
     class runner(N1BaseCfgPPO.runner):
         experiment_name = "N1_FastTD3"
         num_steps_per_env = 1  # off-policy: one step per env per iteration
-        save_interval = 100000
+        save_interval = 10000
         max_iterations = 2000001
         run_name = ""
 
@@ -31,6 +31,7 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         num_steps = 1                   # n-step return (1 = standard)
         gamma = 0.99                    # discount factor (aligned with MuJoCoPlaygroundArgs)
         tau = 0.1                       # target network soft-update rate (aligned with BaseArgs)
+        recent_ratio = 0.5              # sample from recent 50% of buffer (0.0 = uniform)
 
         # --- Critic ---
         critic_learning_rate = 3e-4
@@ -78,7 +79,28 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         critic_seq_len = 8
         actor_seq_len = 8
 
+        # --- Mirror loss (for symmetric learning) ---
+        enable_mirror = True           # enable mirror loss
+        mirror_coef = 0.75              # mirror loss coefficient
+
+        # --- Mamba-2 Actor (set use_mamba=True to enable) ---
+        use_mamba = False               # use Mamba-2 backbone for Actor
+        mamba_d_model = 128            # Mamba hidden dimension
+        mamba_d_state = 16             # SSM state dimension
+        mamba_d_conv = 4               # convolution width
+        mamba_expand = 2               # expansion factor
+        mamba_headdim = 32             # head dimension (d_model * expand / headdim must be multiple of 8)
+        mamba_n_layers = 2             # number of Mamba layers
+
     class rewards(N1MainBodyCfg.rewards):
         class scales(N1MainBodyCfg.rewards.scales):
-            torso_flat_orient = 0.5
-            base_flat_orient = 0.5
+            torso_flat_orient = 0.35
+            base_flat_orient = 0.35
+            action_diff = -5
+            action_diff_diff = -0.75
+            dof_acc = -0.3
+            dof_tor = -0.15
+            feet_orient = 0.5
+            feet_plane = 0.5
+            cmd_diff_base_lin_vel_x = 3
+            cmd_diff_base_lin_vel_y = 2

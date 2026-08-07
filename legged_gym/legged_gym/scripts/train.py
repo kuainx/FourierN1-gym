@@ -30,6 +30,7 @@
 
 import numpy as np
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from datetime import datetime
 
 import isaacgym
@@ -47,6 +48,7 @@ def train(args):
     exp_name = args.run_name + datetime.now().strftime("-%Y%m%d-%H%M%S")
     wandb.init(project="fftai-"+args.task.lower(), config=train_cfg, name=exp_name, sync_tensorboard=True)
     wandb.save("./envs/"+args.task.lower()+"/*")
+    wandb.save("./envs/n1/*")
     wandb.save("./envs/fftai/*")
     ppo_runner.learn(
         num_learning_iterations=train_cfg.runner.max_iterations,
