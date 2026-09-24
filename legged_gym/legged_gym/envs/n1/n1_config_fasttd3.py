@@ -16,6 +16,11 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
     class env(N1MainBodyCfg.env):
         num_envs = 2048  # 4096→1024, free VRAM for replay buffer and Isaac Gym sim
 
+    class self_imitation(N1MainBodyCfg.self_imitation):
+        # Off-policy FastTD3 has a real replay buffer, so historical trajectory
+        # accumulation is natural. Same switch, default on.
+        enable = True
+
     class runner(N1BaseCfgPPO.runner):
         experiment_name = "N1_FastTD3"
         num_steps_per_env = 1  # off-policy: one step per env per iteration
@@ -24,7 +29,18 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         run_name = ""
 
     # FastTD3 algorithm parameters (aligned with FastTD3 examples)
-    class fast_td3:
+    class fast_td3(N1MainBodyCfg.fast_td3):
+        # --- Self-imitation (early-standing) ---
+        # Off-policy FastTD3 has a real replay buffer; trajectory accumulation is natural.
+        enable_self_imitate = True
+        sim_coef = 1.0
+        sim_top_k = 512
+        sim_ema_decay = 0.001
+        sim_start_iter = 0
+        sim_end_iter = 4000
+        sim_decay = "soft"
+        sim_history_capacity = 8192
+
         # --- Core hyperparameters ---
         buffer_size = 1024 * 3 * 2048       # 所有 env 合计的固定总容量（内存预算），runner 按 num_envs 自动折算每 env 容量
         batch_size = 16384 * 2             # total batch size (aligned with BaseArgs)

@@ -18,6 +18,26 @@ class N1MainBodyCfg(N1BaseCfg):
         use_stack = True
         num_stack = 20
 
+    class self_imitation:
+        # Total switch for the self-imitative loss.
+        enable = True
+
+        # --- Stability scoring weights (normalized to sum to 1) ---
+        score_w_h       = 0.4   # base height near target
+        score_w_tilt    = 0.4   # small base roll/pitch (upright)
+        score_w_contact = 0.2   # both feet in contact
+
+        # --- Weighting of the self-imitation BC term ---
+        coef      = 1.0      # β
+        top_k     = 512      # max number of high-score (obs, action) samples used per update
+        score_G_ema_decay = 0.001  # EMA rate for tracking historical best score (G)
+
+        # --- Schedule: soft decay toward ~0, optional hard-off ---
+        start_iter = 0       # iteration when self-imitation starts taking effect
+        end_iter   = 4000    # iteration when weight decays to ~0 (soft) or 0 (hard)
+        decay      = "soft"  # "soft" (exponential, stays tiny, never exact 0) or "hard" (linear to 0)
+
+
     class asset(N1BaseCfg.asset):
         file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/N1/urdf/N1_main_body_raw.urdf"
 
@@ -189,8 +209,19 @@ class N1MainBodyCfgPPO(N1BaseCfgPPO, N1MainBodyCfg):
     runner_class_name = "OnPolicyRunnerMirror"
 
     class algorithm(N1BaseCfgPPO.algorithm):
-        class_name = "PPOMirror"
+        class_name = "PPOSelfImitate"
         # mirror_coef = 0.25
+
+        # ---- Self-imitation (early-standing) ----
+        # These are read by PPOSelfImitate via **self.algorithm_cfg.
+        enable_self_imitate = True
+        sim_coef = 1.0
+        sim_top_k = 512
+        sim_ema_decay = 0.001
+        sim_start_iter = 0
+        sim_end_iter = 4000
+        sim_decay = "soft"
+        sim_history_capacity = 8192
 
     class policy(N1BaseCfgPPO.policy):
         init_noise_std = [0.2] * N1MainBodyCfg.env.num_actions

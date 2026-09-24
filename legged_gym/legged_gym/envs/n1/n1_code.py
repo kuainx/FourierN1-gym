@@ -302,3 +302,44 @@ class N1(LeggedRobotFFTAIBipedal):
         # print(weight)
 
         return penalty * weight
+
+    # ==========================================================================================================================
+    # Self-imitation: stability scoring (early-standing self-imitation)
+    # Pure physics quantities; does NOT depend on gait_patterns / stand command.
+    def compute_stability_score(self):
+        """
+        Compute a per-env stability score in [0, 1] reflecting how close the robot is to
+        stable standing: base height near target, small base roll/pitch, and both feet in contact.
+
+        Returns:
+            torch.Tensor: (num_envs,) float score.
+        """
+        # base height offset already computed in compute_observation_variables ([-1, 1])
+        # only penalize deviation beyond tolerance
+        err_h = (self.base_heights_offset - 0.0).abs()
+        err_h = (err_h - self.cfg.rewards.base_height_offset_range_limit) * (err_h > self.cfg.rewards.base_height_offset_range_limit)
+        r_h = torch.clamp(1.0 - err_h.squeeze(1) / 1.0, 0.0, 1.0)
+
+        # base roll / pitch from projected gravity: [0,1,2] = world z in base frame
+        # upright => base_projected_gravity ~ [0, 0, 1]
+        g_proj = self.base_projected_gravity  # (num_envs, 3)
+        # horizontal tilt magnitude: sqrt(gx^2 + gy^2), 0 when upright
+        tilt = torch.norm(g_proj[:, :2], dim=-1)
+        r_tilt = torch.clamp(1.0 - tilt / 0.4, 0.0, 1.0)
+
+        # both feet in contact
+        feet_contact = self.feet_contact  # (num_envs, 2) bool
+        r_contact = (feet_contact[:, 0] & feet_contact[:, 1]).float()
+
+        score = (
+            self.cfg.self_imitation.score_w_h * r_h
+            + self.cfg.self_imitation.score_w_tilt * r_tilt
+            + self.cfg.self_imitation.score_w_contact * r_contact
+        )
+        # normalize weights to sum to 1
+        total_w = (
+            self.cfg.self_imitation.score_w_h
+            + self.cfg.self_imitation.score_w_tilt
+            + self.cfg.self_imitation.score_w_contact
+        )
+        return score / max(total_w, 1e-6)

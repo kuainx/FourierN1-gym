@@ -39,7 +39,7 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
             log_dir=None,
             device="cpu",
     ):
-        """Init method of OnPolicyRunner.
+        """Init method of OnPolicyRunnerMirror.
 
         Args:
             env (VecEnv): environment the robots live in and interact with.
@@ -97,6 +97,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
                                          mirror=mirror,
                                          **self.algorithm_cfg)
 
+        # give the algorithm a handle to the env (used for stability score / mirror)
+        if hasattr(self.algorithm, "set_sim_env"):
+            self.algorithm.set_sim_env(self.env)
+
         # init storage and model
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -133,6 +137,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
         self.algorithm.actor_critic.train()
         self.algorithm.actor_critic.actor.train()
 
+        # ---- self-imitation setup ----
+        if hasattr(self.algorithm, "reset_sim"):
+            self.algorithm.reset_sim(self.env.num_envs, self.num_steps_per_env)
+
         ep_infos = []
         rew_buffer = deque(maxlen=100)
         len_buffer = deque(maxlen=100)
@@ -143,6 +151,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            # forward current iteration to the algorithm (for decay schedule)
+            if hasattr(self.algorithm, "set_sim_iter"):
+                self.algorithm.set_sim_iter(it)
 
             # Rollout
             with torch.inference_mode():  # 关闭 Actor 梯度计算，开启训练数据采集过程
@@ -159,6 +171,12 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
                     # get obs
                     obs, critic_obs, rewards, dones = \
                         obs.to(self.device), critic_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+
+                    # self-imitation: accumulate obs/actions and stability score per env
+                    if hasattr(self.algorithm, "sim_append"):
+                        self.algorithm.sim_append(obs, actions)
+                        stab = self.env.compute_stability_score()
+                        self.algorithm.sim_accumulate_score(stab, dones)
 
                     # process env step
                     self.algorithm.process_env_step(rewards, dones, infos)
@@ -181,6 +199,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
                 collection_time = stop - start
                 start = stop
 
+                # self-imitation: finalize any still-running trajectories at end of rollout
+                if hasattr(self.algorithm, "sim_finalize_remaining"):
+                    self.algorithm.sim_finalize_remaining()
+
                 # Learning step
                 self.algorithm.compute_returns(critic_obs)
 
@@ -191,6 +213,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
 
             mean_mirror_loss = \
                 self.algorithm.update_mirror()
+
+            mean_sim_loss = 0.0
+            if hasattr(self.algorithm, "update_sim"):
+                mean_sim_loss = self.algorithm.update_sim()
 
             # will clear storage here!
             self.algorithm.clear_storage()
@@ -220,6 +246,10 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
         addition_log_string = (
             f"""{'Mirror loss:':>{pad}} {self.algorithm.mean_mirror_loss:.6f}\n"""
         )
+        if hasattr(self.algorithm, "mean_sim_loss"):
+            addition_log_string += (
+                f"""{'Self-imitate loss:':>{pad}} {self.algorithm.mean_sim_loss:.6f}\n"""
+            )
 
         return addition_log_string
 
@@ -234,3 +264,5 @@ class OnPolicyRunnerMirror(OnPolicyRunner):
         super().log(locs, width, pad)
 
         self.writer.add_scalar('Loss/mirror', locs['mean_mirror_loss'], locs['it'])
+        if 'mean_sim_loss' in locs:
+            self.writer.add_scalar('Loss/self_imitate', locs['mean_sim_loss'], locs['it'])

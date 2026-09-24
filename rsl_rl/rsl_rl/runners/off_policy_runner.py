@@ -282,6 +282,29 @@ class OffPolicyRunner:
                 )
                 self.enable_mirror = False
 
+        # --- Self-imitation (early-standing) ---
+        self.enable_sim = self.fast_td3_cfg.get("enable_self_imitate", False)
+        self.sim_coef = self.fast_td3_cfg.get("sim_coef", 1.0)
+        self.sim_top_k = self.fast_td3_cfg.get("sim_top_k", 512)
+        self.sim_ema_decay = self.fast_td3_cfg.get("sim_ema_decay", 0.001)
+        self.sim_start_iter = self.fast_td3_cfg.get("sim_start_iter", 0)
+        self.sim_end_iter = self.fast_td3_cfg.get("sim_end_iter", 4000)
+        self.sim_decay = self.fast_td3_cfg.get("sim_decay", "soft")
+        self.sim_G = None          # EMA of historical best trajectory stability score
+        self.mean_sim_loss = 0.0   # for logging
+        if self.enable_sim and not hasattr(env, "compute_stability_score"):
+            print(
+                "Warning: Environment doesn't support compute_stability_score(). "
+                "Disabling self-imitation."
+            )
+            self.enable_sim = False
+        if self.enable_sim:
+            print(
+                f"Self-imitation enabled: coef={self.sim_coef} top_k={self.sim_top_k} "
+                f"ema={self.sim_ema_decay} start={self.sim_start_iter} "
+                f"end={self.sim_end_iter} decay={self.sim_decay}"
+            )
+
         # --- Track state ---
         self.action_low = -1.0
         self.action_high = 1.0
@@ -347,6 +370,22 @@ class OffPolicyRunner:
             self.env.num_envs, dtype=torch.float, device=self.device
         )
 
+        # --- Self-imitation state (early-standing) ---
+        if self.enable_sim:
+            self.sim_stab_acc = torch.zeros(
+                self.env.num_envs, dtype=torch.float, device=self.device
+            )
+            self.sim_hist_obs = []        # list of (n_frames, obs_dim)
+            self.sim_hist_actions = []
+            self.sim_hist_score = []      # list of (n_frames,) shared traj score
+            self.sim_hist_frames = 0
+            self.sim_hist_capacity = int(
+                self.fast_td3_cfg.get("sim_history_capacity", 8192)
+            )
+            self.sim_G = None
+            self.sim_iter = 0
+
+
         global_step = 0
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -354,6 +393,9 @@ class OffPolicyRunner:
 
         for it in range(start_iter, tot_iter):
             start = time.time()
+
+            if self.enable_sim:
+                self.sim_iter = it
 
             # --- Record obs into buffer with previous step's next_obs ---
             # (On first iteration there's no previous step; we skip recording)
@@ -406,6 +448,16 @@ class OffPolicyRunner:
                 transition["critic_observations"] = critic_obs
                 transition["next"]["critic_observations"] = next_critic_obs
             self.rb.extend(transition)
+
+            # --- Self-imitation: accumulate per-env stability score for current
+            #     trajectory; when envs finish, push their (obs, action, score)
+            #     into a small high-score buffer (frame-level, bounded).
+            if self.enable_sim and hasattr(self, "sim_stab_acc"):
+                stab = self.env.compute_stability_score()
+                self.sim_stab_acc += stab.to(self.device)
+                done_mask = (dones > 0) | time_outs
+                if done_mask.any():
+                    self._sim_finalize(done_mask)
 
             # 帧堆叠对拍：刚写入条目的重建（obs 与 next）必须与 env 当步返回一致
             verify_until = (
@@ -702,6 +754,11 @@ class OffPolicyRunner:
                     * self.mirror_coef
                 )
 
+            # Self-imitation loss: imitate high-stability standing frames
+            sim_loss = torch.tensor(0.0, device=self.device)
+            if self.enable_sim and self.sim_coef > 0:
+                sim_loss = self._sim_bc_loss(data)
+
             qf1, qf2 = self.qnet(critic_observations, current_actions)
             qf1_value = self.qnet.get_value(
                 torch.nn.functional.softmax(qf1, dim=1)
@@ -713,7 +770,7 @@ class OffPolicyRunner:
                 qf_value = torch.minimum(qf1_value, qf2_value)
             else:
                 qf_value = (qf1_value + qf2_value) / 2.0
-            actor_loss = -qf_value.mean() + mirror_loss
+            actor_loss = -qf_value.mean() + mirror_loss + sim_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(actor_loss).backward()
@@ -732,7 +789,92 @@ class OffPolicyRunner:
         logs_dict["actor_grad_norm"] = actor_grad_norm.detach().clone()
         logs_dict["actor_loss"] = actor_loss.detach().clone()
         logs_dict["mirror_loss"] = mirror_loss.detach().clone()
+        if self.enable_sim:
+            logs_dict["sim_loss"] = sim_loss.detach().clone()
         return logs_dict
+
+    # ------------------------------------------------------------------
+    # Self-imitation helpers (early-standing BC, mounted like mirror loss)
+    # ------------------------------------------------------------------
+    def _sim_finalize(self, done_mask):
+        """Push (obs, action, shared trajectory score) of finished envs into the
+        high-score history buffer."""
+        done_mask = done_mask.to(self.device)
+        done_ids = done_mask.nonzero(as_tuple=False).squeeze(1)
+        if done_ids.numel() == 0:
+            return
+        # frames of these envs are in rb; gather the last n_stack frames
+        n_stack = self.num_stack
+        obs_dim = self.rb.n_single_obs
+        for e in done_ids.tolist():
+            # indices of the current trajectory's last n_stack frames
+            end_ptr = (self.rb.ptr - 1) % self.rb.buffer_size
+            start = (end_ptr - n_stack + 1) % self.rb.buffer_size
+            if n_stack > 1:
+                idx = torch.arange(start, start + n_stack) % self.rb.buffer_size
+                obs_frames = self.rb.observations[e, idx].reshape(-1, obs_dim)  # (n_stack, obs_dim)
+                act_frames = self.rb.actions[e, idx].reshape(-1, self.rb.n_act)
+            else:
+                obs_frames = self.rb.observations[e, end_ptr : end_ptr + 1]
+                act_frames = self.rb.actions[e, end_ptr : end_ptr + 1]
+            s = self.sim_stab_acc[e].detach()
+            if s <= 1e-3 or obs_frames.numel() == 0:
+                continue
+            self.sim_hist_obs.append(obs_frames.clone())
+            self.sim_hist_actions.append(act_frames.clone())
+            self.sim_hist_score.append(s.expand(obs_frames.shape[0]))
+            self.sim_hist_frames += obs_frames.shape[0]
+        # trim to capacity
+        while self.sim_hist_frames > self.sim_hist_capacity and len(self.sim_hist_obs) > 1:
+            dropped = self.sim_hist_obs.pop(0).shape[0]
+            self.sim_hist_actions.pop(0)
+            self.sim_hist_score.pop(0)
+            self.sim_hist_frames -= dropped
+        # reset accumulators for finished envs
+        self.sim_stab_acc[done_mask] = 0.0
+
+    def _sim_bc_loss(self, data):
+        """BC on high-stability frames: w * ||pi(s) - a_explore||^2, w decaying with iter."""
+        w_iter = self._sim_schedule_weight(self.sim_iter)
+        if w_iter <= 0 or self.sim_hist_frames == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        obs = torch.cat(self.sim_hist_obs, dim=0)
+        acts = torch.cat(self.sim_hist_actions, dim=0)
+        scores = torch.cat(self.sim_hist_score, dim=0)
+        k = min(self.sim_top_k, obs.shape[0])
+        if k < obs.shape[0]:
+            idx = torch.argsort(scores, descending=True)[:k]
+            obs = obs[idx]
+            acts = acts[idx]
+            scores = scores[idx]
+
+        # G = EMA of historical best trajectory score (paper's R_max)
+        best = scores.max()
+        if self.sim_G is None:
+            self.sim_G = best.detach()
+        else:
+            self.sim_G = (1 - self.sim_ema_decay) * self.sim_G + self.sim_ema_decay * best
+        G = self.sim_G.detach().clamp(min=1e-4)
+
+        # weights: beta * exp((s - G)/G) * w_iter
+        w = self.sim_coef * torch.exp((scores - G) / G).clamp(max=10.0)
+        w = w * w_iter
+
+        current_actions = self.actor(obs)
+        bc = (w * (current_actions - acts).pow(2).mean(dim=-1)).mean()
+        self.mean_sim_loss = bc.item()
+        return bc
+
+    def _sim_schedule_weight(self, it):
+        if it < self.sim_start_iter:
+            return 0.0
+        if it >= self.sim_end_iter:
+            return 1e-3 if self.sim_decay == "soft" else 0.0
+        t = (it - self.sim_start_iter) / max(1, self.sim_end_iter - self.sim_start_iter)
+        if self.sim_decay == "hard":
+            return 1.0 - t
+        return float(torch.exp(-3.0 * torch.tensor(t, device=self.device)).item())
 
     # ------------------------------------------------------------------
     # Logging
