@@ -26,10 +26,10 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
     # FastTD3 algorithm parameters (aligned with FastTD3 examples)
     class fast_td3:
         # --- Core hyperparameters ---
-        buffer_size = 2048              # replay buffer capacity per env (aligned with MTBenchArgs)
-        batch_size = 32768              # total batch size (aligned with BaseArgs)
+        buffer_size = 1024 * 3 * 2048       # 所有 env 合计的固定总容量（内存预算），runner 按 num_envs 自动折算每 env 容量
+        batch_size = 16384 * 2             # total batch size (aligned with BaseArgs)
         num_steps = 1                   # n-step return (1 = standard)
-        gamma = 0.99                    # discount factor (aligned with MuJoCoPlaygroundArgs)
+        gamma = 0.98                    # discount factor (aligned with MuJoCoPlaygroundArgs)
         tau = 0.1                       # target network soft-update rate (aligned with BaseArgs)
         recent_ratio = 0.5              # sample from recent 50% of buffer (0.0 = uniform)
 
@@ -56,7 +56,7 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         # --- Training control ---
         total_timesteps = 150000        # total environment steps
         learning_starts = 10            # steps before first update (aligned with BaseArgs)
-        num_updates = 2                 # UTD ratio (aligned with BaseArgs)
+        num_updates = 4                 # UTD ratio (aligned with BaseArgs)
         log_interval = 100              # console log every N iterations
         disable_bootstrap = False       # disable bootstrap from terminal states
 
@@ -68,7 +68,9 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         amp_dtype = "bf16"
         use_grad_norm_clipping = False
         max_grad_norm = 0.0
-        cpu_buffer = True              # store replay buffer on CPU to save GPU memory
+        cpu_buffer = False              # 单帧存储后 buffer ≈8GB，直接放显存；如 OOM 可改回 True（放内存）
+        verify_stack_frames = True      # 训练初期对拍验证堆叠重建（防帧错乱/重置清零不一致）
+        verify_stack_steps = 1000       # 前 N 步逐条校验，通过后自动关闭
 
         # --- Observation normalization ---
         obs_normalization = True
@@ -81,7 +83,7 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
 
         # --- Mirror loss (for symmetric learning) ---
         enable_mirror = True           # enable mirror loss
-        mirror_coef = 0.75              # mirror loss coefficient
+        mirror_coef = 1.5              # mirror loss coefficient
 
         # --- Mamba-2 Actor (set use_mamba=True to enable) ---
         use_mamba = False               # use Mamba-2 backbone for Actor
@@ -94,13 +96,14 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
 
     class rewards(N1MainBodyCfg.rewards):
         class scales(N1MainBodyCfg.rewards.scales):
-            torso_flat_orient = 0.35
-            base_flat_orient = 0.35
-            action_diff = -5
-            action_diff_diff = -0.75
-            dof_acc = -0.3
-            dof_tor = -0.15
-            feet_orient = 0.5
-            feet_plane = 0.5
-            cmd_diff_base_lin_vel_x = 3
-            cmd_diff_base_lin_vel_y = 2
+            cmd_diff_base_ang_vel_yaw = 2.0
+    #         torso_flat_orient = 0.35
+    #         base_flat_orient = 0.35
+            # action_diff = -5
+            # action_diff_diff = -0.75
+            # dof_acc = -0.3
+            # dof_tor = -0.15
+            # feet_orient = 0.5
+            # feet_plane = 0.5
+            # cmd_diff_base_lin_vel_x = 3
+            # cmd_diff_base_lin_vel_y = 2

@@ -3,6 +3,7 @@ from legged_gym.utils.gym_math import get_euler_xyz
 
 from legged_gym.envs.fftai.legged_robot_fftai_bipedal_code import LeggedRobotFFTAIBipedal
 from legged_gym.envs.n1.n1_config import N1Cfg
+from legged_gym.utils.math import wrap_to_pi
 
 
 class N1(LeggedRobotFFTAIBipedal):
@@ -188,8 +189,9 @@ class N1(LeggedRobotFFTAIBipedal):
         # print("base_euler",base_euler)
         # print("left_foot_euler",left_foot_euler)
         # print("right_foot_euler",right_foot_euler)
-        error_left = torch.abs(base_euler - left_foot_euler)
-        error_right = torch.abs(base_euler - right_foot_euler)
+        # wrap 到 (-pi, pi]，避免 base/foot 欧拉角跨 ±pi 时虚假误差跳变
+        error_left = torch.abs(wrap_to_pi(base_euler - left_foot_euler))
+        error_right = torch.abs(wrap_to_pi(base_euler - right_foot_euler))
         # print("error_left",error_left)
         # print("error_right",error_right)
         reward_feet_rot = torch.exp(-1.0 * (error_left[:,2]+error_right[:,2]))
@@ -204,26 +206,32 @@ class N1(LeggedRobotFFTAIBipedal):
         left_foot_rot = self.rigid_body_states[:, self.feet_indices[0]][:,3:7]
         right_foot_rot = self.rigid_body_states[:, self.feet_indices[1]][:,3:7]
         base_euler = get_euler_xyz(base_link_rot)
-        base_euler[:,1] = 0
+        # 平地目标：roll/pitch 均以世界系水平面为参考（不再跟随躯干侧倾）
+        base_euler[:,0] = 0  # roll 目标 = 0：脚掌与地面平行
+        base_euler[:,1] = 0  # pitch 目标 = 0：世界系水平（下方 target 添加摆动上翘偏置）
         left_foot_euler = get_euler_xyz(left_foot_rot)
         right_foot_euler = get_euler_xyz(right_foot_rot)
         target_euler_left = torch.zeros_like(base_euler)
         target_euler_right = torch.zeros_like(base_euler)
+        # 摆动相脚尖上翘目标：0.1 rad（原 0.2，上翘过大会让后跟成为最低点 → 抬脚瞬间拖地）
         target_euler_left[:,1] = 0.2 * self.swing_mask[:,0]
         target_euler_right[:,1] = 0.2 * self.swing_mask[:,1]
 
         # print("base_euler",base_euler)
         # print("left_foot_euler",left_foot_euler)
         # print("right_foot_euler",right_foot_euler)
-        error_left = torch.abs(base_euler - left_foot_euler - target_euler_left)
-        error_right = torch.abs(base_euler - right_foot_euler - target_euler_right)
+        # wrap 到 (-pi, pi]，避免 base/foot 欧拉角跨 ±pi 时虚假误差跳变
+        error_left = torch.abs(wrap_to_pi(base_euler - left_foot_euler - target_euler_left))
+        error_right = torch.abs(wrap_to_pi(base_euler - right_foot_euler - target_euler_right))
 
         # print("error_left",error_left)
         # print("error_right",error_right)
         # error_plane = error_left + error_right
         # reward_feet_plane = torch.exp(-3.0 * (error_plane[:,0] + error_plane[:,1]))
-        reward_left_plane = 1. * torch.exp(-3.0 * error_left[:,1]) + 0.5 * torch.exp(-10.0 * error_left[:,0]) + 0.5 * torch.exp(-10.0 * error_left[:,2])
-        reward_right_plane = 1. * torch.exp(-3.0 * error_right[:,1]) + 0.5 * torch.exp(-10.0 * error_right[:,0]) + 0.5 * torch.exp(-10.0 * error_right[:,2])
+        # roll/pitch 项均用线性饱和：exp(-10·err) 在 err>0.2 rad 时梯度消失，
+        # 无法纠正 10~20° 的脚掌倾斜；0.3 rad 内线性递减，超出后保持恒定梯度推回
+        reward_left_plane = 1. * (1.0 - torch.clamp(error_left[:,1] / 0.3, max=1.0)) + 0.5 * (1.0 - torch.clamp(error_left[:,0] / 0.3, max=1.0)) + 0.5 * torch.exp(-10.0 * error_left[:,2])
+        reward_right_plane = 1. * (1.0 - torch.clamp(error_right[:,1] / 0.3, max=1.0)) + 0.5 * (1.0 - torch.clamp(error_right[:,0] / 0.3, max=1.0)) + 0.5 * torch.exp(-10.0 * error_right[:,2])
         return reward_left_plane + reward_right_plane
 
 
@@ -272,56 +280,6 @@ class N1(LeggedRobotFFTAIBipedal):
         rew_pos_low = torch.sum(rew_pos_low, dim=1)
         return rew_pos_low
 
-
-    # def _reward_feet_clearance(self):
-    #     """
-    #     Calculates reward based on the clearance of the swing leg from the ground during movement.
-    #     Encourages appropriate lift of the feet during the swing phase of the gait.
-    #     """
-    #     # Compute feet contact mask
-    #     feet_z = self.rigid_body_states[:, self.feet_indices, 2] - 0.10
-    #     # contact = torch.zeros_like(feet_z)
-    #     # max_indices = torch.argmin(feet_z, dim=1)
-    #     # contact[torch.arange(feet_z.size(0)), max_indices] = 1
-    #     # contact = contact.bool()
-    #     contact = self.contact_forces[:, self.feet_indices, 2] > 5.
-
-    #     # Get the z-position of the feet and compute the change in z-position
-
-    #     delta_z = feet_z - self.last_feet_z
-    #     self.feet_height += delta_z
-    #     self.last_feet_z = feet_z
-
-
-    #     # 奖励高于target_height
-    #     rew_pos = (self.cfg.rewards.target_feet_height - self.feet_height) * 100 # unit: mm
-    #     rew_pos = torch.clip(rew_pos, -6, 100)
-    #     rew_pos = torch.exp(-0.2 * rew_pos)
-    #     rew_pos *= self.swing_mask
-    #     # 惩罚低于target_height/2
-    #     pen_pos = (self.cfg.rewards.target_feet_height/2 - self.feet_height) * 100 # unit: mm
-    #     pen_pos = torch.clip(pen_pos, 0, 20)
-    #     pen_pos = 1 - torch.exp(0.2 * pen_pos)
-    #     pen_pos *= self.swing_mask
-    #     # 惩罚高于target_height*2
-    #     pen_pos_high = (self.feet_height - self.cfg.rewards.target_feet_height * 1.5) * 100 # unit: mm
-    #     pen_pos_high = torch.clip(pen_pos_high, 0, 20)
-    #     pen_pos_high = 1 - torch.exp(0.3 * pen_pos_high)
-    #     pen_pos_high *= self.swing_mask
-    #     # 惩罚支撑脚高于target_height/2
-    #     pen_pos_low = (self.feet_height - self.cfg.rewards.target_feet_height/4) * 100 # unit: mm
-    #     pen_pos_low = torch.clip(pen_pos_high, 0, 20)
-    #     pen_pos_low = 1 - torch.exp(0.3 * pen_pos_high)
-    #     pen_pos_low *= self.stance_mask
-    #     # 奖励支撑脚贴近地面
-    #     rew_pos_low = (self.feet_height)*100 # unit: mm
-    #     rew_pos_low = torch.exp(-0.2 * rew_pos_low)
-    #     rew_pos_low *= self.stance_mask
-    #     print(self.feet_height)
-
-    #     rew_pos = torch.sum(rew_pos, dim=1) + torch.sum(pen_pos, dim=1) + torch.sum(pen_pos_high, dim=1) + torch.sum(pen_pos_low, dim=1) + torch.sum(rew_pos_low, dim=1)
-    #     self.feet_height *= ~contact
-    #     return rew_pos
     def _reward_feet_contact_forces(self):
         """
         Calculates the reward for keeping contact forces within a specified range. Penalizes
@@ -335,7 +293,7 @@ class N1(LeggedRobotFFTAIBipedal):
         # print(self.contact_forces_limit)
 
         # 超限部分：低于 0.75 * limit 的部分不计，超出的部分使用平方惩罚
-        excess = (forces_norm - self.contact_forces_limit * 0.9).clamp(min=0,max=2000)
+        excess = (forces_norm - self.contact_forces_limit * 1.1).clamp(min=0,max=2000)
         penalty = torch.sum(excess, dim=1)  # 平方后对各脚求和
 
         steps = self.episode_length_buf.float()   # 确保为浮点，shape: (num_envs,)

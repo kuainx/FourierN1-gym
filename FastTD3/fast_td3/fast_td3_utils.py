@@ -24,6 +24,7 @@ class SimpleReplayBuffer(nn.Module):
         device=None,
         cpu_buffer: bool = False,
         recent_ratio: float = 0.0,  # 0.0 = uniform, >0 = sample from recent portion
+        n_stack: int = 1,  # 帧堆叠数：>1 时只存单帧观测（n_obs/n_stack 维），采样时重建堆叠
     ):
         """
         A simple replay buffer that stores transitions in a circular buffer.
@@ -54,8 +55,25 @@ class SimpleReplayBuffer(nn.Module):
         self.buffer_device = torch.device("cpu") if cpu_buffer else device
         self.recent_ratio = recent_ratio  # fraction of buffer to sample from (recent-first)
 
+        # 帧堆叠模式：buffer 只存单帧观测，sample 时从相邻 n_stack 帧重建堆叠，
+        # 存储量减为 1/n_stack，可显著降低 buffer 内存占用（支持放回显存）。
+        self.n_stack = int(n_stack)
+        self._stack_mode = self.n_stack > 1
+        if self._stack_mode:
+            assert n_steps == 1, (
+                "frame-stacked buffer (n_stack > 1) only supports n_steps == 1"
+            )
+            assert n_obs % self.n_stack == 0, (
+                f"n_obs ({n_obs}) must be divisible by n_stack ({self.n_stack})"
+            )
+            self.n_single_obs = n_obs // self.n_stack
+        else:
+            self.n_single_obs = n_obs
+
         self.observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=self.buffer_device, dtype=torch.float
+            (n_env, buffer_size, self.n_single_obs),
+            device=self.buffer_device,
+            dtype=torch.float,
         )
         self.actions = torch.zeros(
             (n_env, buffer_size, n_act), device=self.buffer_device, dtype=torch.float
@@ -68,7 +86,9 @@ class SimpleReplayBuffer(nn.Module):
             (n_env, buffer_size), device=self.buffer_device, dtype=torch.long
         )
         self.next_observations = torch.zeros(
-            (n_env, buffer_size, n_obs), device=self.buffer_device, dtype=torch.float
+            (n_env, buffer_size, self.n_single_obs),
+            device=self.buffer_device,
+            dtype=torch.float,
         )
         if asymmetric_obs:
             if self.playground_mode:
@@ -105,6 +125,11 @@ class SimpleReplayBuffer(nn.Module):
         dones = tensor_dict["next"]["dones"].to(self.buffer_device)
         truncations = tensor_dict["next"]["truncations"].to(self.buffer_device)
         next_observations = tensor_dict["next"]["observations"].to(self.buffer_device)
+
+        if self._stack_mode:
+            # 堆叠观测的最后 n_single_obs 维即当前帧，只存这一帧
+            observations = observations[..., -self.n_single_obs :]
+            next_observations = next_observations[..., -self.n_single_obs :]
 
         ptr = self.ptr % self.buffer_size
         self.observations[:, ptr] = observations
@@ -145,14 +170,28 @@ class SimpleReplayBuffer(nn.Module):
                 indices = torch.randint(
                     0, filled, (self.n_env, batch_size), device=self.buffer_device
                 )
-            obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
             act_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_act)
-            observations = torch.gather(self.observations, 1, obs_indices).reshape(
-                self.n_env * batch_size, self.n_obs
-            )
-            next_observations = torch.gather(
-                self.next_observations, 1, obs_indices
-            ).reshape(self.n_env * batch_size, self.n_obs)
+            if self._stack_mode:
+                # 单帧存储：从 buffer 相邻 n_stack 帧重建堆叠观测（布局 [最老..最新]，
+                # 与 env 的 obs_stack 一致），跨 reset 边界按 env 语义清零
+                observations = self._gather_stack(self.observations, indices)
+                next_observations = self._gather_stack(
+                    self.next_observations, indices, next_mode=True
+                )
+                observations = observations.reshape(
+                    self.n_env * batch_size, self.n_obs
+                )
+                next_observations = next_observations.reshape(
+                    self.n_env * batch_size, self.n_obs
+                )
+            else:
+                obs_indices = indices.unsqueeze(-1).expand(-1, -1, self.n_obs)
+                observations = torch.gather(self.observations, 1, obs_indices).reshape(
+                    self.n_env * batch_size, self.n_obs
+                )
+                next_observations = torch.gather(
+                    self.next_observations, 1, obs_indices
+                ).reshape(self.n_env * batch_size, self.n_obs)
             actions = torch.gather(self.actions, 1, act_indices).reshape(
                 self.n_env * batch_size, self.n_act
             )
@@ -410,6 +449,64 @@ class SimpleReplayBuffer(nn.Module):
             # Roll back the truncation flags introduced for safe sampling
             self.truncations[:, current_pos - 1] = curr_truncations
         return out.to(self.device)
+
+    def _gather_stack(self, store, indices, next_mode=False):
+        """从单帧存储重建堆叠观测。
+
+        布局 [最老..最新]，与 env 的 obs_stack 一致。
+
+        关键语义（legged_gym）：done 当步 reset 会**原地清零** runner 引用的 obs
+        张量，因此：
+        - entry r 的 obs 帧 = done(r) ? 0 : obs_buf(r-1)（当步帧被清零丢失）；
+        - entry r 的 next 帧 = obs_buf(r)（B_r 清零后推帧，恒真实）。
+        - obs 重建：窗口内最后一个 done（含最新行）之前的帧清零；
+          最新行 done（当步）→ 整窗清零（obs 本身就是全零）。
+        - next 重建：仅清理"done 行自身"之前的帧（done 行帧保留）。
+        """
+        k = self.n_stack
+        indices = indices.to(store.device)
+        n_env, batch = indices.shape
+        ns = self.n_single_obs
+        offsets = torch.arange(k - 1, -1, -1, device=indices.device).view(1, 1, k)
+        win_idx = (indices.unsqueeze(-1) - offsets) % self.buffer_size
+        win_flat = win_idx.reshape(n_env, batch * k, 1).expand(-1, -1, ns)
+        obs_frames = self.observations.gather(1, win_flat).reshape(
+            n_env, batch, k, ns
+        )
+        nxt_frames = self.next_observations.gather(1, win_flat).reshape(
+            n_env, batch, k, ns
+        )
+        d = self.dones.gather(1, win_idx.reshape(n_env, batch * k)).reshape(
+            n_env, batch, k
+        ).bool()
+
+        if next_mode:
+            frames = nxt_frames
+            # 帧 obs_buf(s)（行 s）被清 iff 存在 done j > s（j ≤ t）
+            base = torch.flip(
+                torch.cumsum(torch.flip(d, dims=[2]).to(torch.float), dim=2) > 0,
+                dims=[2],
+            )
+            clear = torch.cat(
+                [base[..., 1:], torch.zeros_like(base[..., :1])], dim=2
+            )
+        else:
+            frames = obs_frames
+            # done 的历史效果已由 entry 存储（存 0）编码；
+            # 只需处理当步 done（最新行）→ 整窗清零，以及更早 done 的累积清零
+            clear = torch.flip(
+                torch.cumsum(torch.flip(d, dims=[2]).to(torch.float), dim=2) > 0,
+                dims=[2],
+            )
+        frames = frames * (~clear).unsqueeze(-1)
+        return frames.reshape(n_env, batch, k * ns)
+
+    @torch.no_grad()
+    def rebuild_stack(self, indices):
+        """对拍用：按给定 buffer indices（每 env 一条）重建堆叠观测。"""
+        assert self._stack_mode, "rebuild_stack only valid in frame-stacked mode"
+        indices = indices.to(self.buffer_device)
+        return self._gather_stack(self.observations, indices)
 
 
 class EmpiricalNormalization(nn.Module):

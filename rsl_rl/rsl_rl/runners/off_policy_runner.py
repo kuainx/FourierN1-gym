@@ -204,9 +204,18 @@ class OffPolicyRunner:
 
         # --- Replay buffer ---
         self.asymmetric_obs = env.num_pri_obs is not None
+        # buffer_size 在配置里是跨所有 env 的固定总容量（内存预算），
+        # 此处按实际 num_envs 折算成每 env 容量，保证总内存不随 num_envs 变化。
+        total_buffer_size = self.fast_td3_cfg.get("buffer_size", 1024 * 50)
+        buffer_size_per_env = max(1, total_buffer_size // num_envs)
+        self.num_stack = (
+            env.cfg.env.num_stack
+            if hasattr(env.cfg, "env") and env.cfg.env.use_stack
+            else 1
+        )
         self.rb = SimpleReplayBuffer(
             n_env=num_envs,
-            buffer_size=self.fast_td3_cfg.get("buffer_size", 1024 * 50),
+            buffer_size=buffer_size_per_env,
             n_obs=n_obs,
             n_act=n_act,
             n_critic_obs=n_critic_obs,
@@ -217,7 +226,15 @@ class OffPolicyRunner:
             device=device,
             cpu_buffer=self.fast_td3_cfg.get("cpu_buffer", False),
             recent_ratio=self.fast_td3_cfg.get("recent_ratio", 0.0),
+            n_stack=self.num_stack,
         )
+        # 帧堆叠对拍验证：训练初期用 env 返回的真实堆叠观测校验 buffer 重建，
+        # 任何帧错位/重置清零不一致都会在训练早期直接报错
+        self.verify_stack_frames = (
+            self.fast_td3_cfg.get("verify_stack_frames", False) and self.num_stack > 1
+        )
+        self.verify_stack_steps = self.fast_td3_cfg.get("verify_stack_steps", 2000)
+        self._verify_until = 0  # >0 时作为验证截止（遇到 reset 后延长）
 
         # --- AMP setup ---
         self.amp_enabled = (
@@ -249,6 +266,21 @@ class OffPolicyRunner:
             "use_grad_norm_clipping", False
         )
         self.max_grad_norm = self.fast_td3_cfg.get("max_grad_norm", 0.0)
+
+        # --- Mirror loss (for left/right symmetric learning) ---
+        self.enable_mirror = self.fast_td3_cfg.get("enable_mirror", False)
+        self.mirror_coef = self.fast_td3_cfg.get("mirror_coef", 0.0)
+        if self.enable_mirror and self.mirror_coef > 0:
+            if hasattr(env, "get_mirror_observations") and hasattr(
+                env, "get_mirror_actions"
+            ):
+                print(f"Mirror loss enabled with coef={self.mirror_coef}")
+            else:
+                print(
+                    "Warning: Environment doesn't support mirror operations. "
+                    "Disabling mirror loss."
+                )
+                self.enable_mirror = False
 
         # --- Track state ---
         self.action_low = -1.0
@@ -375,6 +407,71 @@ class OffPolicyRunner:
                 transition["next"]["critic_observations"] = next_critic_obs
             self.rb.extend(transition)
 
+            # 帧堆叠对拍：刚写入条目的重建（obs 与 next）必须与 env 当步返回一致
+            verify_until = (
+                min(self.verify_stack_steps, self._verify_until)
+                if self._verify_until > 0
+                else self.verify_stack_steps
+            )
+            if self.verify_stack_frames and it < verify_until:
+                write_idx = (self.rb.ptr - 1) % self.rb.buffer_size
+                verify_indices = torch.full(
+                    (self.env.num_envs, 1), write_idx, dtype=torch.long
+                )
+                rebuilt = self.rb.rebuild_stack(verify_indices).squeeze(1)
+                ok = torch.allclose(rebuilt, obs, atol=1e-6, rtol=1e-5)
+                if ok and self.rb.ptr >= self.num_stack:
+                    # next 重建仅在 buffer 已有 >= num_stack 条时精确：
+                    # 初始 reset 推入的首帧在 buffer 之外，前 num_stack-1 条
+                    # 的 next 观测会缺少该最老帧（有界、自愈，训练影响可忽略）
+                    rebuilt_next = self.rb._gather_stack(
+                        self.rb.next_observations, verify_indices, next_mode=True
+                    ).squeeze(1)
+                    ok = ok and torch.allclose(
+                        rebuilt_next, next_obs, atol=1e-6, rtol=1e-5
+                    )
+                if not ok:
+                    # 详细诊断：逐帧全零 mask + 逐帧 diff + 全量 dones，定位根因
+                    diff = (rebuilt - obs).abs()
+                    bad = (diff.max(dim=1).values > 1e-6).nonzero().flatten()
+                    lines = [
+                        f"Frame-stack rebuild mismatch at it={it}: "
+                        f"write_idx={write_idx} ptr={self.rb.ptr} "
+                        f"num_stack={self.num_stack} bad_envs={bad[:5].tolist()}"
+                    ]
+                    ns = self.rb.n_single_obs
+                    for e in bad[:2].tolist():
+                        obs_f = obs[e].view(self.num_stack, ns)
+                        reb_f = rebuilt[e].view(self.num_stack, ns)
+                        obs_zero = (obs_f.abs().max(dim=1).values == 0).cpu().tolist()
+                        reb_zero = (reb_f.abs().max(dim=1).values == 0).cpu().tolist()
+                        per_frame = (obs_f - reb_f).abs().max(dim=1).values.cpu().tolist()
+                        dones_all = self.rb.dones[e, : write_idx + 1].cpu().tolist()
+                        nz = diff[e].nonzero().flatten()[:10].cpu().tolist()
+                        lines.append(
+                            f"  env={e} obs_frame_zero={obs_zero}"
+                        )
+                        lines.append(
+                            f"          reb_frame_zero={reb_zero}"
+                        )
+                        lines.append(
+                            f"          per_frame_maxdiff={[f'{x:.3g}' for x in per_frame]}"
+                        )
+                        lines.append(
+                            f"          dones[0..{write_idx}]={dones_all}"
+                        )
+                        lines.append(f"          diff_dims={nz}")
+                        lines.append(
+                            f"          obs_f0[:12]={obs[e][:12].cpu().tolist()}"
+                        )
+                        lines.append(
+                            f"          reb_f0[:12]={rebuilt[e][:12].cpu().tolist()}"
+                        )
+                    raise RuntimeError("\n".join(lines))
+                # 出现 reset 后，至少再验证 num_stack 步，确保重置后窗口完整刷新
+                if prev_dones.any():
+                    self._verify_until = max(self._verify_until, it + self.num_stack)
+
             # --- Update obs pointers ---
             obs = next_obs
             critic_obs = next_critic_obs
@@ -497,10 +594,11 @@ class OffPolicyRunner:
             if self.disable_bootstrap:
                 bootstrap = (~dones).float()
             else:
-                # Don't bootstrap for timeouts: legged_gym auto-resets env on
-                # timeout, so next_obs has resampled commands (different context).
-                # Bootstrapping with mismatched commands corrupts Q-values.
-                bootstrap = (~dones).float()
+                # Bootstrap through truncations (timeouts) but not terminal dones.
+                # When `disable_bootstrap=False`, truncations are treated as
+                # non-terminal so the Q-value bootstrap is applied (aligned with
+                # FastTD3 train.py semantics).
+                bootstrap = (truncations | ~dones).float()
 
             # Target policy smoothing
             clipped_noise = torch.randn_like(actions)
@@ -576,7 +674,7 @@ class OffPolicyRunner:
         return logs_dict
 
     def _update_pol_impl(self, data, logs_dict):
-        """Actor update: maximize Q-value."""
+        """Actor update: maximize Q-value + optional mirror loss."""
         with autocast(
             device_type="cuda",
             dtype=self.amp_dtype,
@@ -588,7 +686,23 @@ class OffPolicyRunner:
                 else data["observations"]
             )
 
-            qf1, qf2 = self.qnet(critic_observations, self.actor(data["observations"]))
+            # Compute current actions (deterministic policy, same as FastTD3 train.py)
+            current_actions = self.actor(data["observations"])
+
+            # Mirror loss: enforce left/right symmetric actions
+            mirror_loss = torch.tensor(0.0, device=self.device)
+            if self.enable_mirror and self.mirror_coef > 0:
+                mirror_obs = self.env.get_mirror_observations(
+                    data["observations"]
+                )
+                mirror_actions = self.actor(mirror_obs)
+                target_actions = self.env.get_mirror_actions(mirror_actions)
+                mirror_loss = (
+                    nn.functional.mse_loss(current_actions, target_actions)
+                    * self.mirror_coef
+                )
+
+            qf1, qf2 = self.qnet(critic_observations, current_actions)
             qf1_value = self.qnet.get_value(
                 torch.nn.functional.softmax(qf1, dim=1)
             )
@@ -599,7 +713,7 @@ class OffPolicyRunner:
                 qf_value = torch.minimum(qf1_value, qf2_value)
             else:
                 qf_value = (qf1_value + qf2_value) / 2.0
-            actor_loss = -qf_value.mean()
+            actor_loss = -qf_value.mean() + mirror_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(actor_loss).backward()
@@ -617,6 +731,7 @@ class OffPolicyRunner:
         self.scaler.update()
         logs_dict["actor_grad_norm"] = actor_grad_norm.detach().clone()
         logs_dict["actor_loss"] = actor_loss.detach().clone()
+        logs_dict["mirror_loss"] = mirror_loss.detach().clone()
         return logs_dict
 
     # ------------------------------------------------------------------
@@ -665,6 +780,12 @@ class OffPolicyRunner:
         if "qf_min" in logs_dict:
             self.writer.add_scalar(
                 "Loss/qf_min", logs_dict["qf_min"].mean(), locs["it"]
+            )
+        if "mirror_loss" in logs_dict:
+            self.writer.add_scalar(
+                "Loss/mirror_loss",
+                logs_dict["mirror_loss"].mean(),
+                locs["it"],
             )
 
         self.writer.add_scalar(
@@ -717,6 +838,10 @@ class OffPolicyRunner:
         if "actor_loss" in logs_dict:
             log_string += (
                 f"{'Actor loss:':>{pad}} {logs_dict['actor_loss'].mean().item():.4f}\n"
+            )
+        if "mirror_loss" in logs_dict:
+            log_string += (
+                f"{'Mirror loss:':>{pad}} {logs_dict['mirror_loss'].mean().item():.4f}\n"
             )
         if len(rew_buffer) > 0:
             log_string += (

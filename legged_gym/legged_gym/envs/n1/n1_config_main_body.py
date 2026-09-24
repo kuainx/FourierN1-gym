@@ -35,9 +35,9 @@ class N1MainBodyCfg(N1BaseCfg):
         # ]
         terrain_proportions = [
             0.1, 0.1,
+            0.0, 0.0,
             0.2, 0.2,
-            0.1, 0.1,
-            0.1, 0.1,
+            0.3, 0.1,
             0.0, 0.0,
             0.0, 0.0,
         ]

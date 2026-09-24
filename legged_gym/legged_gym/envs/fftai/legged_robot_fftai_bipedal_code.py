@@ -432,23 +432,44 @@ class LeggedRobotFFTAIBipedal(LeggedRobotFFTAI):
 
     # ----------------------------------------------
 
-    def get_left_foot_height(self):
-        left_foot_height = torch.mean(
-            self.rigid_body_states[:, self.feet_indices][:, 0, 2:3]
-            - self.cfg.asset.foot_thickness
-            - self.measured_heights,
-            dim=1).unsqueeze(1)
+    def _get_foot_bottom_min_height(self, foot_idx):
+        """脚掌底面四角最低点的离地高度。
 
-        return left_foot_height
+        用脚掌底面四角（局部系 x: 前/后, y: 左/右, z: 脚底向下为负）旋到世界系后
+        取 z 最小值，再减地形高度基准。相比直接用 link 中心高度：
+        脚尖/脚跟着地时 link 中心会上抬，但底面最低点（实际接触点）仍贴近地面，
+        避免"接近地面"门控被单点着地绕过。
+        """
+        foot_state = self.rigid_body_states[:, self.feet_indices][:, foot_idx, :]
+        foot_pos = foot_state[:, 0:3]   # (N, 3)
+        foot_quat = foot_state[:, 3:7]  # (N, 4)
+        thickness = self.cfg.asset.foot_thickness
+
+        # 脚掌底面四角的 link 局部坐标（x 前/后, y 左右, z 向下为负）
+        corners = torch.tensor(
+            [
+                [0.130, -0.010, -thickness],
+                [0.130, 0.010, -thickness],
+                [-0.080, -0.010, -thickness],
+                [-0.080, 0.010, -thickness],
+            ],
+            device=self.device,
+        )  # (4, 3)
+
+        # 四角旋到世界系：(N, 4, 3)
+        q_expand = foot_quat.unsqueeze(1).expand(-1, 4, 4)
+        v_expand = corners.unsqueeze(0).expand(foot_quat.shape[0], -1, -1)
+        world_corners = foot_pos.unsqueeze(1) + quat_apply(q_expand, v_expand)
+
+        # 最低点世界系 z - 地形平均高度
+        z_min = world_corners[:, :, 2].min(dim=1).values  # (N,)
+        return (z_min - self.measured_heights.mean(dim=1)).unsqueeze(1)
+
+    def get_left_foot_height(self):
+        return self._get_foot_bottom_min_height(0)
 
     def get_right_foot_height(self):
-        right_foot_height = torch.mean(
-            self.rigid_body_states[:, self.feet_indices][:, 1, 2:3]
-            - self.cfg.asset.foot_thickness
-            - self.measured_heights,
-            dim=1).unsqueeze(1)
-
-        return right_foot_height
+        return self._get_foot_bottom_min_height(1)
 
     def get_left_foot_height_target(self):
         left_foot_height_target = 0.0
