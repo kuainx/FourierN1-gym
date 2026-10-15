@@ -290,7 +290,8 @@ class OffPolicyRunner:
         self.sim_start_iter = self.fast_td3_cfg.get("sim_start_iter", 0)
         self.sim_end_iter = self.fast_td3_cfg.get("sim_end_iter", 4000)
         self.sim_decay = self.fast_td3_cfg.get("sim_decay", "soft")
-        self.sim_G = None          # EMA of historical best trajectory stability score
+        self.sim_min_score = 0.05  # per-frame score floor: 剔垃圾帧（选帧交给相对 top_k）
+        self.sim_G = None          # EMA of historical best per-frame score
         self.mean_sim_loss = 0.0   # for logging
         if self.enable_sim and not hasattr(env, "compute_stability_score"):
             print(
@@ -370,14 +371,18 @@ class OffPolicyRunner:
             self.env.num_envs, dtype=torch.float, device=self.device
         )
 
-        # --- Self-imitation state (early-standing) ---
+        # --- Self-imitation state (task-aware scoring) ---
         if self.enable_sim:
-            self.sim_stab_acc = torch.zeros(
-                self.env.num_envs, dtype=torch.float, device=self.device
+            # 每 env 最近 num_stack 步的逐帧 task score ring（slot0 最新）
+            self.sim_frame_scores = torch.zeros(
+                self.env.num_envs,
+                self.num_stack,
+                dtype=torch.float,
+                device=self.device,
             )
-            self.sim_hist_obs = []        # list of (n_frames, obs_dim)
+            self.sim_hist_obs = []        # list of (n_frames, n_obs)
             self.sim_hist_actions = []
-            self.sim_hist_score = []      # list of (n_frames,) shared traj score
+            self.sim_hist_score = []      # list of (n_frames,) per-frame task score
             self.sim_hist_frames = 0
             self.sim_hist_capacity = int(
                 self.fast_td3_cfg.get("sim_history_capacity", 8192)
@@ -449,12 +454,12 @@ class OffPolicyRunner:
                 transition["next"]["critic_observations"] = next_critic_obs
             self.rb.extend(transition)
 
-            # --- Self-imitation: accumulate per-env stability score for current
-            #     trajectory; when envs finish, push their (obs, action, score)
-            #     into a small high-score buffer (frame-level, bounded).
-            if self.enable_sim and hasattr(self, "sim_stab_acc"):
+            # --- Self-imitation: 每步把逐帧 task score 推进 ring（slot0 最新）；
+            #     env 结束时把 (obs, action, 每帧自己的分数) 推入高分缓冲。
+            if self.enable_sim and hasattr(self, "sim_frame_scores"):
                 stab = self.env.compute_stability_score()
-                self.sim_stab_acc += stab.to(self.device)
+                self.sim_frame_scores = torch.roll(self.sim_frame_scores, 1, dims=1)
+                self.sim_frame_scores[:, 0] = stab.to(self.device)
                 done_mask = (dones > 0) | time_outs
                 if done_mask.any():
                     self._sim_finalize(done_mask)
@@ -797,7 +802,7 @@ class OffPolicyRunner:
     # Self-imitation helpers (early-standing BC, mounted like mirror loss)
     # ------------------------------------------------------------------
     def _sim_finalize(self, done_mask):
-        """Push (obs, action, shared trajectory score) of finished envs into the
+        """Push (obs, action, per-frame task score) of finished envs into the
         high-score history buffer."""
         done_mask = done_mask.to(self.device)
         done_ids = done_mask.nonzero(as_tuple=False).squeeze(1)
@@ -805,36 +810,78 @@ class OffPolicyRunner:
             return
         # frames of these envs are in rb; gather the last n_stack frames
         n_stack = self.num_stack
-        obs_dim = self.rb.n_single_obs
         for e in done_ids.tolist():
             # indices of the current trajectory's last n_stack frames
             end_ptr = (self.rb.ptr - 1) % self.rb.buffer_size
             start = (end_ptr - n_stack + 1) % self.rb.buffer_size
             if n_stack > 1:
                 idx = torch.arange(start, start + n_stack) % self.rb.buffer_size
-                obs_frames = self.rb.observations[e, idx].reshape(-1, obs_dim)  # (n_stack, obs_dim)
+                # 逐帧重建与 actor 输入一致的堆叠观测（布局 [最老..最新]）。
+                # 最新一行是 done 步，其堆叠窗口会被 _gather_stack 按 reset 语义
+                # 整窗清零，需剔除全零窗口，只保留真实历史帧。
+                obs_windows = self.rb._gather_stack(
+                    self.rb.observations, idx.unsqueeze(0)
+                ).squeeze(0)  # (n_stack, n_obs)
                 act_frames = self.rb.actions[e, idx].reshape(-1, self.rb.n_act)
+                keep = obs_windows.abs().sum(dim=1) > 0
+                obs_windows = obs_windows[keep]
+                act_frames = act_frames[keep]
             else:
-                obs_frames = self.rb.observations[e, end_ptr : end_ptr + 1]
+                obs_windows = self.rb.observations[e, end_ptr : end_ptr + 1]
                 act_frames = self.rb.actions[e, end_ptr : end_ptr + 1]
-            s = self.sim_stab_acc[e].detach()
-            if s <= 1e-3 or obs_frames.numel() == 0:
+            # 每帧配自己的 task 分：ring slot0 最新，帧按 [最老..最新] 排列故 flip 对齐；
+            # 配对"该帧之后的状态稳不稳"（即该状态上的动作质量），20 帧窗口内分数平滑，
+            # 1 步偏移的影响可忽略。整段累计分时代"尾帧摔倒却得高分"的问题由此消除。
+            frame_scores = self.sim_frame_scores[e, :n_stack].flip(0)
+            if n_stack > 1:
+                frame_scores = frame_scores[keep]
+            # 逐帧分数下限：剔除垃圾帧，选帧交给相对 top_k
+            keep2 = (frame_scores > self.sim_min_score).to(obs_windows.device)
+            obs_windows = obs_windows[keep2]
+            act_frames = act_frames[keep2]
+            frame_scores = frame_scores[keep2]
+            if obs_windows.numel() == 0:
                 continue
-            self.sim_hist_obs.append(obs_frames.clone())
+            # 训练时 actor 消费的是 obs_normalizer 归一化后的观测，
+            # 历史帧也统一先归一化（update=False，不重复更新统计量）。
+            obs_windows = self.obs_normalizer(
+                obs_windows.to(self.device), update=False
+            )
+            self.sim_hist_obs.append(obs_windows.clone())
             self.sim_hist_actions.append(act_frames.clone())
-            self.sim_hist_score.append(s.expand(obs_frames.shape[0]))
-            self.sim_hist_frames += obs_frames.shape[0]
-        # trim to capacity
-        while self.sim_hist_frames > self.sim_hist_capacity and len(self.sim_hist_obs) > 1:
-            dropped = self.sim_hist_obs.pop(0).shape[0]
-            self.sim_hist_actions.pop(0)
-            self.sim_hist_score.pop(0)
-            self.sim_hist_frames -= dropped
-        # reset accumulators for finished envs
-        self.sim_stab_acc[done_mask] = 0.0
+            self.sim_hist_score.append(frame_scores.clone())
+            self.sim_hist_frames += obs_windows.shape[0]
+        # trim to capacity: 按分数淘汰（保留历史最高分条目），而非按时间丢队首。
+        # 早期偶发的抬脚/高分帧不会被后来的低分帧挤出。
+        if self.sim_hist_frames > self.sim_hist_capacity:
+            entry_max = torch.tensor(
+                [sc.max() for sc in self.sim_hist_score], device=self.device
+            )
+            order = torch.argsort(entry_max, descending=True)
+            kept_frames, kept_idx = 0, []
+            for i in order.tolist():
+                if kept_frames + self.sim_hist_obs[i].shape[0] > self.sim_hist_capacity:
+                    break
+                kept_idx.append(i)
+                kept_frames += self.sim_hist_obs[i].shape[0]
+            # 单条就超容量时（正常情况下不会发生），至少保留最高分那条
+            if not kept_idx:
+                kept_idx = [order[0].item()]
+                kept_frames = self.sim_hist_obs[kept_idx[0]].shape[0]
+            keep_set = set(kept_idx)
+            self.sim_hist_obs = [
+                o for j, o in enumerate(self.sim_hist_obs) if j in keep_set
+            ]
+            self.sim_hist_actions = [
+                a for j, a in enumerate(self.sim_hist_actions) if j in keep_set
+            ]
+            self.sim_hist_score = [
+                s for j, s in enumerate(self.sim_hist_score) if j in keep_set
+            ]
+            self.sim_hist_frames = kept_frames
 
     def _sim_bc_loss(self, data):
-        """BC on high-stability frames: w * ||pi(s) - a_explore||^2, w decaying with iter."""
+        """BC on high-score task frames: w * ||pi(s) - a_explore||^2, w decaying with iter."""
         w_iter = self._sim_schedule_weight(self.sim_iter)
         if w_iter <= 0 or self.sim_hist_frames == 0:
             return torch.tensor(0.0, device=self.device)
@@ -929,6 +976,17 @@ class OffPolicyRunner:
                 logs_dict["mirror_loss"].mean(),
                 locs["it"],
             )
+        if "sim_loss" in logs_dict:
+            self.writer.add_scalar(
+                "Loss/sim_loss",
+                logs_dict["sim_loss"].mean(),
+                locs["it"],
+            )
+        if self.enable_sim:
+            # 高分帧池容量：观察池是否在积累数据（0 说明 BC 没生效）
+            self.writer.add_scalar(
+                "Loss/sim_hist_frames", self.sim_hist_frames, locs["it"]
+            )
 
         self.writer.add_scalar(
             "Loss/critic_lr",
@@ -984,6 +1042,10 @@ class OffPolicyRunner:
         if "mirror_loss" in logs_dict:
             log_string += (
                 f"{'Mirror loss:':>{pad}} {logs_dict['mirror_loss'].mean().item():.4f}\n"
+            )
+        if "sim_loss" in logs_dict:
+            log_string += (
+                f"{'Sim loss:':>{pad}} {logs_dict['sim_loss'].mean().item():.4f}\n"
             )
         if len(rew_buffer) > 0:
             log_string += (

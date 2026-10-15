@@ -29,25 +29,28 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         run_name = ""
 
     # FastTD3 algorithm parameters (aligned with FastTD3 examples)
-    class fast_td3(N1MainBodyCfg.fast_td3):
+    class fast_td3:
         # --- Self-imitation (early-standing) ---
         # Off-policy FastTD3 has a real replay buffer; trajectory accumulation is natural.
-        enable_self_imitate = True
+        enable_self_imitate = False
         sim_coef = 1.0
         sim_top_k = 512
         sim_ema_decay = 0.001
         sim_start_iter = 0
-        sim_end_iter = 4000
-        sim_decay = "soft"
+        # 单条轨迹最长 = episode_length_s/(dt*decimation) = 1000 迭代。
+        # 100000 ≈ 100 条整轨迹，覆盖"学会站立+按时钟抬脚"的探索阶段。
+        sim_end_iter = 200000
+        # 线性 1→0：窗口内强度稳定，结束时精确归零；soft(exp) 中后期形同虚设且不能归零
+        sim_decay = "hard"
         sim_history_capacity = 8192
 
         # --- Core hyperparameters ---
         buffer_size = 1024 * 3 * 2048       # 所有 env 合计的固定总容量（内存预算），runner 按 num_envs 自动折算每 env 容量
         batch_size = 16384 * 2             # total batch size (aligned with BaseArgs)
         num_steps = 1                   # n-step return (1 = standard)
-        gamma = 0.98                    # discount factor (aligned with MuJoCoPlaygroundArgs)
+        gamma = 0.97                    # discount factor (aligned with MuJoCoPlaygroundArgs)
         tau = 0.1                       # target network soft-update rate (aligned with BaseArgs)
-        recent_ratio = 0.5              # sample from recent 50% of buffer (0.0 = uniform)
+        recent_ratio = 0.1              # sample from recent 50% of buffer (0.0 = uniform)
 
         # --- Critic ---
         critic_learning_rate = 3e-4
@@ -99,7 +102,7 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
 
         # --- Mirror loss (for symmetric learning) ---
         enable_mirror = True           # enable mirror loss
-        mirror_coef = 1.5              # mirror loss coefficient
+        mirror_coef = 1              # mirror loss coefficient
 
         # --- Mamba-2 Actor (set use_mamba=True to enable) ---
         use_mamba = False               # use Mamba-2 backbone for Actor

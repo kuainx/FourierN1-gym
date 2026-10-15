@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -1364,7 +1364,7 @@ class LeggedRobot(BaseTask):
             for i in self.torso_indices:
                 # if is base_link, pass
                 if i == 0:
-                    pass
+                    continue
 
                 mass = props[i].mass
                 mass *= np.random.uniform(multiply_torso_mass_range[0], multiply_torso_mass_range[1])

@@ -304,42 +304,63 @@ class N1(LeggedRobotFFTAIBipedal):
         return penalty * weight
 
     # ==========================================================================================================================
-    # Self-imitation: stability scoring (early-standing self-imitation)
-    # Pure physics quantities; does NOT depend on gait_patterns / stand command.
+    # Self-imitation: unified task-aware scoring (works for BOTH stand & walk)
+    # 任务差异完全由 self.commands / self.swing_clock 编码，同一套公式自适应：
+    #   - track_score:   基座速度对指令速度的跟踪质量
+    #     * stand(cmd≈0) → 奖励"静止别动"
+    #     * walk(cmd≠0)  → 奖励"速度跟得上指令"
+    #   - safe_score:    直立(倾角小) + 基座高度在目标 ±tol 米内（与任务无关）
+    #   - foot_clock:    只评"摆动脚"是否抬到目标高度（线性单边斜坡）
+    #     lift = clamp(feet_height / target, 0, 1)：地面=0，达目标=1，超目标也=1
+    #     swing_mask 至多一只脚为 1（walk 摆动相）；无摆动脚（双支撑过渡/stand）→ 中性 1
+    # score = w_cmd * track + w_safe * safe + w_foot * foot_clock
     def compute_stability_score(self):
         """
-        Compute a per-env stability score in [0, 1] reflecting how close the robot is to
-        stable standing: base height near target, small base roll/pitch, and both feet in contact.
+        Compute a per-env task-aware score in (0, 1] used by self-imitation
+        (BC on high-score frames). A single formula covers both stand and walk:
+        command tracking (velocity vs cmd) + safety (tilt / height)
+        + swing-foot lift score (linear, one-sided).
 
         Returns:
             torch.Tensor: (num_envs,) float score.
         """
-        # base height offset already computed in compute_observation_variables ([-1, 1])
-        # only penalize deviation beyond tolerance
-        err_h = (self.base_heights_offset - 0.0).abs()
-        err_h = (err_h - self.cfg.rewards.base_height_offset_range_limit) * (err_h > self.cfg.rewards.base_height_offset_range_limit)
-        r_h = torch.clamp(1.0 - err_h.squeeze(1) / 1.0, 0.0, 1.0)
+        cfg = self.cfg.self_imitation
 
-        # base roll / pitch from projected gravity: [0,1,2] = world z in base frame
-        # upright => base_projected_gravity ~ [0, 0, 1]
-        g_proj = self.base_projected_gravity  # (num_envs, 3)
-        # horizontal tilt magnitude: sqrt(gx^2 + gy^2), 0 when upright
-        tilt = torch.norm(g_proj[:, :2], dim=-1)
-        r_tilt = torch.clamp(1.0 - tilt / 0.4, 0.0, 1.0)
-
-        # both feet in contact
-        feet_contact = self.feet_contact  # (num_envs, 2) bool
-        r_contact = (feet_contact[:, 0] & feet_contact[:, 1]).float()
-
-        score = (
-            self.cfg.self_imitation.score_w_h * r_h
-            + self.cfg.self_imitation.score_w_tilt * r_tilt
-            + self.cfg.self_imitation.score_w_contact * r_contact
+        # --- track: exp of normalized L1 velocity error vs command ---
+        err_x = (self.base_lin_vel[:, 0] - self.commands[:, 0]).abs()
+        err_y = (self.base_lin_vel[:, 1] - self.commands[:, 1]).abs()
+        err_w = (self.base_ang_vel[:, 2] - self.commands[:, 2]).abs()
+        track = torch.exp(
+            -(
+                err_x / cfg.score_sigma_lin_vel_x
+                + err_y / cfg.score_sigma_lin_vel_y
+                + err_w / cfg.score_sigma_ang_vel_yaw
+            )
         )
-        # normalize weights to sum to 1
-        total_w = (
-            self.cfg.self_imitation.score_w_h
-            + self.cfg.self_imitation.score_w_tilt
-            + self.cfg.self_imitation.score_w_contact
+
+        # --- safe: upright tilt + base height within +/-tol meters ---
+        g_proj = self.base_projected_gravity  # (num_envs, 3), world z in base frame
+        tilt = torch.norm(g_proj[:, :2], dim=-1)  # 0 when upright
+        r_tilt = torch.clamp(1.0 - tilt / cfg.score_tilt_limit, 0.0, 1.0)
+        err_h = (self.root_states[:, 2] - self.cfg.rewards.base_height_target).abs()
+        r_h = torch.clamp(1.0 - err_h / cfg.score_height_tol, 0.0, 1.0)
+        safe = (cfg.score_w_tilt * r_tilt + cfg.score_w_height * r_h) / (
+            cfg.score_w_tilt + cfg.score_w_height
         )
-        return score / max(total_w, 1e-6)
+
+        # --- foot_clock: 只评摆动脚，线性单边斜坡 ---
+        # lift = clamp(feet_height / target, 0, 1)：地面=0，达目标=1，超目标也=1。
+        # swing_mask 至多一只脚为 1，乘后求和即该脚 lift；
+        # 无摆动脚（双支撑过渡/stand）→ 中和为 1，不扭曲总分。
+        lift = torch.clamp(
+            self.feet_height / cfg.score_foot_target_height, 0.0, 1.0
+        )
+        foot_clock = (lift * self.swing_mask).sum(dim=1) + (
+            1.0 - self.swing_mask.any(dim=1).float()
+        )
+
+        return (
+            cfg.score_w_cmd * track
+            + cfg.score_w_safe * safe
+            + cfg.score_w_foot * foot_clock
+        )

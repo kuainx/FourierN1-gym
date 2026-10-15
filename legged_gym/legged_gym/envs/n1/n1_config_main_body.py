@@ -22,10 +22,26 @@ class N1MainBodyCfg(N1BaseCfg):
         # Total switch for the self-imitative loss.
         enable = True
 
-        # --- Stability scoring weights (normalized to sum to 1) ---
-        score_w_h       = 0.4   # base height near target
-        score_w_tilt    = 0.4   # small base roll/pitch (upright)
-        score_w_contact = 0.2   # both feet in contact
+        # --- Task-aware scoring (one unified formula for stand & walk) ---
+        # score = w_cmd*track(指令跟踪) + w_safe*safe(倾角+高度) + w_foot*foot_clock
+        # 任务差异由指令+抬脚时钟编码：stand(clock=0)→教双脚贴地；walk→按时钟抬脚
+        score_w_cmd  = 0.4
+        score_w_safe = 0.1
+        score_w_foot = 0.5
+
+        # track = exp(-Σ|vel - cmd|/σ)，σ 按各指令维度量纲取
+        score_sigma_lin_vel_x   = 0.5
+        score_sigma_lin_vel_y   = 0.5
+        score_sigma_ang_vel_yaw = 0.5
+
+        # safe = 直立(倾角) + 基座高度在目标 ±tol 米内
+        score_w_tilt     = 0.5
+        score_w_height   = 0.5
+        score_tilt_limit = 0.4   # 倾角(投影水平分量)超过该值分归 0
+        score_height_tol = 0.2   # ±0.2 m 高度容差
+
+        # foot_clock = 只评摆动脚是否抬到目标高度：lift = clamp(feet_height/target,0,1)
+        score_foot_target_height = 0.20   # 目标抬脚高度（= target_feet_height；想更严可 0.12~0.16）
 
         # --- Weighting of the self-imitation BC term ---
         coef      = 1.0      # β
@@ -101,14 +117,14 @@ class N1MainBodyCfg(N1BaseCfg):
             """
             feet_speed_xy_close_to_ground = 0.50
             feet_force_z_close_to_ground = -0.50
-            feet_stumble = -5.0
+            feet_stumble = -3.0
             feet_distance_too_close = -0.50
             feet_distance_y_too_close = -1.0
             feet_distance_y_too_far = -1.0
 
             feet_air_time = 2.00  # two feet -> 1.0
             feet_orient = 0.4
-            feet_plane = 0.3
+            feet_plane = 0.8
 
             # feet_clearance = 0.8
             feet_swing_high = 0.3

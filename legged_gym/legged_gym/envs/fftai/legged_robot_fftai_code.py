@@ -118,13 +118,9 @@ class LeggedRobotFFTAI(LeggedRobot):
         self.feet_height = torch.zeros(self.num_envs, len(self.feet_indices), device=self.device, requires_grad=False)
 
         for i in range(len(self.feet_indices)):
-            foot_height = torch.mean(
-                self.rigid_body_states[:, self.feet_indices][:, i, 2:3]
-                - self.cfg.asset.foot_thickness
-                - self.measured_heights,
-                dim=1)
-
-            self.feet_height[:, i] = foot_height
+            # 用脚掌底面最低点（而非 link 中心）离地高度：
+            # 脚尖/脚跟着地时 link 中心会上抬，但最低点仍贴近地面，避免误判"脚已抬起"
+            self.feet_height[:, i] = self._get_foot_bottom_min_height(i).squeeze(1)
 
 
     def _calculate_feet_distance(self):
