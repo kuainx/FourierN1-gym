@@ -102,8 +102,10 @@ class Mamba2LayerJit(nn.Module):
             D = D.view(self.nheads, 1)
 
         # 顺序 SSM 扫描（替代 Triton 块扫描）
-        state = torch.zeros(batch, self.nheads, self.headdim, self.d_state,
-                            device=u.device, dtype=torch.float32)
+        # 用 u.new_zeros 保证 trace 后设备随输入动态确定
+        # （torch.zeros 会在 trace 时把 CPU 设备烘焙进图，导出模型上 GPU 会报设备错）
+        state = u.new_zeros(batch, self.nheads, self.headdim, self.d_state,
+                            dtype=torch.float32)
 
         outputs = []
         for t in range(seqlen):
