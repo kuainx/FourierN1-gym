@@ -609,7 +609,8 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         # mamba_d_conv = 4             # 卷积宽度
         # mamba_expand = 2             # 扩展因子
         # mamba_n_layers = 2           # Mamba 层数
-        # mamba_headdim = 32           # 显式保留！默认 64→nheads=4 违反「8 的倍数」约束（T0.3-d）
+        # mamba_headdim = 32           # 保持 nheads=8：headdim = d_model*expand//8（默认 64 使 nheads=4，
+        #                              #   触发 causal_conv1d channel-last stride 约束，非 Triton 约束，T0.3-d）
         # seq_len = 20                 # 序列长度 = env.num_stack
         # actor_hidden_dims = [256, 256, 128, 64]   # T0.2 跨算法统一（与 FastTD3-Mamba 头一致）
         # critic_hidden_dims = [256, 128]           # PPO 特有；FastTD3 critic 为分布式 Q，不可比

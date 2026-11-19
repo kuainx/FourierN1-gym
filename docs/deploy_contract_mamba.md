@@ -47,11 +47,11 @@
 
 | # | 分量 | 维数 | 缩放 | 说明 |
 |---|---|---|---|---|
-| 1 | `commands[:, 0:3] × commands_scale` | 3 | `commands_scale = [lin_vel, lin_vel, ang_vel] = [2.0, 2.0, 0.25]` | 指令：vx, vy, yaw_rate（base_velocity 档） |
-| 2 | `base_ang_vel × obs_scales.ang_vel` | 3 | `0.25` | 机体系角速度 |
+| 1 | `commands[:, 0:3] × commands_scale` | 3 | `commands_scale = [lin_vel, lin_vel, ang_vel] = [1.0, 1.0, 1.0]` | 指令：vx, vy, yaw_rate（base_velocity 档） |
+| 2 | `base_ang_vel × obs_scales.ang_vel` | 3 | `1.00` | 机体系角速度 |
 | 3 | `base_projected_gravity × obs_scales.gravity` | 3 | `1.0` | 重力在机体系投影 |
 | 4 | `dof_pos_offset × obs_scales.dof_pos` | 13 | `1.0` | 关节相对默认姿态的偏移（左腿 6 + 右腿 6 + 腰 1） |
-| 5 | `dof_vel × obs_scales.dof_vel` | 13 | `0.05` | 关节角速度 |
+| 5 | `dof_vel × obs_scales.dof_vel` | 13 | `0.10` | 关节角速度 |
 | 6 | `actions × obs_scales.action` | 13 | `1.0` | **上一步下发的动作**（tanh 输出 × action_scale 后），首步为 0 |
 | 7 | `swing_clock` | 2 | 无 | 步态时钟，须按训练同款口径生成（见下） |
 
@@ -62,8 +62,14 @@
 - **`swing_clock`** 为步态时钟（2 维），部署端必须按训练侧同款公式/相位约定生成；
   stand/walk 任务差异由 `commands` 与 `swing_clock` 承载，不得自造时钟口径。
 - `dof_pos` 用的是 **offset**（相对默认姿态），不是绝对关节角。
-- 各分量的物理量单位均为国际单位制，缩放系数见上表（来源
-  `legged_robot_config.py` `normalization.obs_scales`；如配置变更以训练配置为准并升版本）。
+- 各分量的物理量单位均为国际单位制。**缩放系数必须取自本次训练使用的配置**：
+  N1 在 `n1_config.py:495-503` 覆盖了 `normalization.obs_scales`
+  （`lin_vel=ang_vel=gravity=dof_pos=action=1.0`、`dof_vel=0.10`），
+  而 `commands_scale` 不是独立参数，由 `legged_robot_code.py:338-352` 现算为
+  `[lin_vel, lin_vel, ang_vel]`，故为 `[1, 1, 1]`。
+  **禁止从 legged_gym 上游默认的 `legged_robot_config.py` 推**（那份是
+  `ang_vel=0.25 / dof_vel=0.05 / commands_scale=[2,2,0.25]`，与 N1 不符）；
+  若配置变更须以 checkpoint 的 `train_cfg` 为准并升版本号。
 
 ## 4. 动作还原
 
@@ -97,15 +103,27 @@
 部署方接入后、实机运行前，必须完成两级对拍（判据与用例见
 `tests/test_mamba_export_parity.py`）：
 
-1. **单测级**（开发侧，每次导出后）：
-   - (a) `Mamba2Encoder`（Triton 训练前向）vs `Mamba2EncoderJit`（导出复现）逐输出比对；
-   - (b) 端到端 `actor(norm_obs)` vs `traced(obs)` 动作比对（含归一化烘焙）；
-   - (c) batch=1 与 batch=8 回归（batch 维不固化）。
-   - 判据：fp32 下 `max|diff| < 1e-5`（参考基线 4.77e-07）。
+1. **单测级**（开发侧，每次导出后）：`tests/test_mamba_export_parity.py`。
+   判据**按参照系分两档**，不可合并成单一条阈值——两者的 fp32 累序本就不同：
+
+   | 档 | 用例 | 参照系 | 判据 |
+   |---|---|---|---|
+   | 严格 | a1：`Mamba2EncoderJit` vs 官方 `Mamba2.step` 递推 | 同一计算顺序 | `max abs diff` < 1e-5 |
+   | 严格 | b1：PPO eager-export vs traced（导出链路自洽） | 同一计算顺序 | `max abs diff` < 1e-5（实测 0.0） |
+   | 漂移 | a2：`Mamba2Encoder`（Triton 并行扫描）vs `Mamba2EncoderJit`（顺序扫描） | **不同扫描顺序** | `max abs diff` < 5e-4 |
+   | 漂移 | b2：`actor(norm_obs)` vs `traced(obs)`（含归一化烘焙） | 不同扫描顺序 + 归一化融合 | `max abs diff` < 5e-4 |
+
+   5e-4 是 fp32 并行累加 vs 顺序累加的舍入差异预算，**不是模型误差**；
+   参考实测（RTX 4090 / fp32 / 2026-11-19）：a1 `8.3e-07`、a2 `2.2e-05`（B=1）
+   与 `9.4e-05`（B=8）、b2 `1.0e-06`~`4.5e-06`。
+   同时须回归 batch=1 与 batch=8（batch 维不固化）。
 2. **轨迹级**（部署方）：录制一段仿真/实机轨迹（逐帧 50 维原始观测 + 动作），
    在部署端运行导出模型，与 Python 策略输出逐位/近逐位比对（含归一化）。
+   本档走**漂移档 5e-4**（部署端递推顺序与训练并行扫描不同）；
+   若部署端也按顺序扫描复现，可要求严格档 1e-5。
    AMP bf16 训练 → fp32 导出的漂移属预期，量级记录在案即可
-   （可参考 `tests/run_traj_parity.py`）。
+   （可参考 `tests/run_traj_parity.py`，注意须加载 checkpoint 内的
+   `obs_normalizer_state_dict`，不要用随机统计）。
 
 ## 8. 已知限制（本版契约）
 
@@ -116,6 +134,22 @@
 2. **终止步观测语义**：训练侧终止转移存入的是清零窗（已知取舍，两条链路一致）；
    部署时输入窗恒含真实最新帧，无影响。
 3. torch 版本迁移（非 2.4.1）时，trace 的 batch 维行为须重测（用例 c）。
+4. **Mamba 头维度约束（T0.3-d，A1 修订）**：约束来自 `causal_conv1d` 的 channel-last
+   布局，不是 Triton。融合路径里 conv 的输入是 `zxbcdt` 的切片视图
+   （`mamba_ssm/ops/triton/ssd_combined.py:964-965`），其通道 stride 等于 in_proj 输出维
+   `D = 2*d_model*expand + 2*ngroups*d_state + nheads`，而 `causal_conv1d` 要求
+   `x.stride(0)`、`x.stride(2)` 均为 8 的倍数，即 **`D % 8 == 0`**。
+   默认 `expand=2, d_state=16` 下该条件等价于 `nheads % 8 == 0`（16 组 d_model×headdim
+   组合实测与预测 16/16 吻合）。不满足时的原始报错（headdim=64 / d_model=128）：
+
+   ```
+   RuntimeError: causal_conv1d with channel last layout requires strides
+   (x.stride(0) and x.stride(2)) to be multiples of 8
+   ```
+
+   因此导出侧不受影响（Jit 走纯 PyTorch 卷积），但**训练前向会直接崩**；
+   改架构时保持 `nheads=8`，即 `headdim = d_model*expand//8`
+   （d_model=96→24、128→32、192→48，均在实测可用集内）。
 
 ---
 
@@ -127,5 +161,5 @@
 - [ ] 动作还原（action_scale / PD / decimation / 控制延迟）与 §4 一致
 - [ ] 无额外观测 clip（§5）
 - [ ] 归一化未重复施加（§0/§6）
-- [ ] 轨迹级对拍通过（§7，diff 量级已记录）
+- [ ] 轨迹级对拍通过（§7，档位 5e-4 与 diff 量级已记录）
 - [ ] 单步时延 < 20 ms 预算（或已立项 T1.5 增量导出）

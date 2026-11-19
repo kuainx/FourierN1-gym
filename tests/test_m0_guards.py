@@ -80,19 +80,37 @@ expect_ok(
                            actor_num_output=13),
 )
 
-# 6. headdim 默认 64（nheads=4 违反 8 倍数）→ 抛错（T0.3-d）
+# 6. headdim=64 + d_model=128 → nheads=4、D=548 → 抛错（T0.3-d，A1 修订后的真实约束）
+#    GPU 实测该配置确实报 causal_conv1d channel-last stride 错误
 expect_raise(
-    "T0.3-d headdim default 64 rejected",
+    "T0.3-d headdim=64 (D=548) rejected",
     lambda: Mamba2Encoder(d_input=50, d_model=128, d_state=16, d_conv=4,
                           expand=2, headdim=64, n_layers=1),
     "multiple of 8",
 )
 
-# 7. headdim=32（nheads=8）→ 通过
+# 7. headdim=32（nheads=8，D=552）→ 通过
 expect_ok(
     "T0.3-d headdim=32 ok",
     lambda: Mamba2Encoder(d_input=50, d_model=128, d_state=16, d_conv=4,
                           expand=2, headdim=32, n_layers=1),
+)
+
+# 7b. 架构消融用：d_model=96 / headdim=24（nheads=8，D=424）→ 通过
+#     旧规则看 nheads=8 也通过；此例锁住「headdim=d_model*expand//8」这条可用配方
+expect_ok(
+    "T0.3-d ablation d_model=96 headdim=24 ok",
+    lambda: Mamba2Encoder(d_input=50, d_model=96, d_state=16, d_conv=4,
+                          expand=2, headdim=24, n_layers=1),
+)
+
+# 7c. nheads=8 但 d_state=2 → D=524 非 8 倍数 → 抛错
+#     证明 nheads%8 只是默认 d_state=16 下的代理规则，不是充要条件
+expect_raise(
+    "T0.3-d nheads=8 but d_state=2 (D=524) rejected",
+    lambda: Mamba2Encoder(d_input=50, d_model=128, d_state=2, d_conv=4,
+                          expand=2, headdim=32, n_layers=1),
+    "multiple of 8",
 )
 
 # 8. rmsnorm=False 门控分支不丢 z（T0.3-c）：构造 Jit 层并跑前向
