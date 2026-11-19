@@ -80,10 +80,15 @@ class OnPolicyRunner:
 
         actor_critic_class = eval(self.policy_cfg["class_name"])
 
+        # T0.1 防呆：把 env.num_stack 传给 policy，Mamba 策略构造时校验
+        # seq_len == num_stack（MLP 策略经 **kwargs 忽略该键）。
+        policy_kwargs = dict(self.policy_cfg)
+        policy_kwargs.setdefault("num_stack", getattr(self.env, "num_stack", None))
+
         actor_critic: ActorCriticMLP = actor_critic_class(actor_num_input,
                                                           critic_num_input,
                                                           actor_num_output,
-                                                          **self.policy_cfg).to(self.device)
+                                                          **policy_kwargs).to(self.device)
 
         # PPO
         algorithm_class = eval(self.algorithm_cfg["class_name"])

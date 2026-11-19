@@ -32,6 +32,25 @@ class Mamba2Encoder(nn.Module):
         self.d_model = d_model
         self.n_layers = n_layers
 
+        # --- 防呆校验（T0.3-d）：headdim 漏配/误配即报错 ---
+        # mamba_ssm 硬约束：d_ssm (= d_model * expand) 须能被 headdim 整除；
+        # 项目约束（Triton 对齐经验，见配置注释）：nheads 须为 8 的倍数。
+        # 代码默认 headdim=64 时 nheads=(128*2)/64=4，违反 8 的倍数约束，
+        # 显式配置 mamba_headdim=32（nheads=8）为已验证安全值。
+        d_ssm = d_model * expand
+        if d_ssm % headdim != 0:
+            raise ValueError(
+                f"d_model*expand ({d_ssm}) must be divisible by headdim ({headdim})."
+            )
+        nheads = d_ssm // headdim
+        if nheads % 8 != 0:
+            raise ValueError(
+                f"nheads (= d_model*expand/headdim = {nheads}) must be a multiple of 8 "
+                f"(Triton alignment constraint). Got headdim={headdim} (d_model={d_model}, "
+                f"expand={expand}). Explicitly set mamba_headdim=32 (nheads=8, verified) "
+                f"in the config instead of relying on the default."
+            )
+
         # 输入投影层：将观测维度映射到 Mamba 隐藏维度
         self.input_proj = nn.Linear(d_input, d_model)
 

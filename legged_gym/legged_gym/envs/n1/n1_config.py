@@ -576,37 +576,23 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         # storage class
         storage_class = "RolloutStorage"
 
-    # class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-    #     class_name = "ActorCriticMLP"
-
-    #     # policy params
-    #     actor_hidden_dims = [1024, 512, 256, 128]
-    #     critic_hidden_dims = [1024, 512, 256, 128]
-    #     activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
-    #     init_weights = False
-
-    #     fixed_std = False
-    #     init_noise_std = [0.2] * N1Cfg.env.num_actions
-
-    #     decay_std = False
-    #     decay_ratio = 1 - 2.0e-6
-    #     decay_std_min = 0.1
+    # ============================================================
+    # PPO 策略开关（T0.1：显式设置即生效、误配即报错）
+    #
+    # 默认 = 基线 C：ActorCriticMLP（与历史 MLP run 行为一致）。
+    # 启用实验 D（PPO+Mamba2）必须「显式」改两处：
+    #   ① class_name = "ActorCriticMamba"（写在本 policy 类内，勿依赖继承/反注释）；
+    #   ② 取消下方 Mamba 键的注释（单层注释，取消即生效）。
+    # 防呆：seq_len 与 env.num_stack 不一致会在构造时直接抛错（T0.1）；
+    #       mamba_* 键误入 ActorCriticMLP 也会直接抛错（不再静默回落）。
+    # ============================================================
     class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-        class_name = "ActorCriticMamba"  # 切换为 Mamba 版本
+        class_name = "ActorCriticMLP"  # 基线 C；实验 D 显式改为 "ActorCriticMamba"
 
-        # Mamba 参数
-        mamba_d_model = 128          # Mamba 隐藏维度
-        mamba_d_state = 16           # SSM 状态维度
-        mamba_d_conv = 4             # 卷积宽度
-        mamba_expand = 2             # 扩展因子
-        mamba_n_layers = 2           # Mamba 层数
-        mamba_headdim = 32           # d_model * expand / headdim = multiple of 8
-        seq_len = 20                 # 序列长度
-
-        # policy params
-        actor_hidden_dims = [256, 128]      # 可适当减小，因为 Mamba 已提取特征
-        critic_hidden_dims = [256, 128]
-        activation = "elu"
+        # policy params（MLP 基线头容量，与历史 MLP run 一致）
+        actor_hidden_dims = [1024, 512, 256, 128]
+        critic_hidden_dims = [1024, 512, 256, 128]
+        activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
         init_weights = False
 
         fixed_std = False
@@ -615,3 +601,17 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         decay_std = False
         decay_ratio = 1 - 2.0e-6
         decay_std_min = 0.1
+
+        # --- Mamba2 键（实验 D：PPO+Mamba，取消注释即启用，见顶部说明）---
+        # 校验：seq_len 必须 = env.num_stack（=20，见 n1_config_main_body.py）。
+        # mamba_d_model = 128          # Mamba 隐藏维度
+        # mamba_d_state = 16           # SSM 状态维度
+        # mamba_d_conv = 4             # 卷积宽度
+        # mamba_expand = 2             # 扩展因子
+        # mamba_n_layers = 2           # Mamba 层数
+        # mamba_headdim = 32           # 显式保留！默认 64→nheads=4 违反「8 的倍数」约束（T0.3-d）
+        # seq_len = 20                 # 序列长度 = env.num_stack
+        # actor_hidden_dims = [256, 256, 128, 64]   # T0.2 跨算法统一（与 FastTD3-Mamba 头一致）
+        # critic_hidden_dims = [256, 128]           # PPO 特有；FastTD3 critic 为分布式 Q，不可比
+        # （历史 PPO-Mamba run 曾用 actor_hidden_dims=[256, 128]；R2：旧值仅供复现参考，
+        #   新对比实验一律用统一后的 [256, 256, 128, 64]。）

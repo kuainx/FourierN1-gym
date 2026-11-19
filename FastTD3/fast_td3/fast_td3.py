@@ -1,17 +1,6 @@
-import os
-import sys
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Add rsl_rl modules path for Mamba2Encoder import
-_RSL_RL_MODULES = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "rsl_rl", "rsl_rl", "modules")
-)
-if _RSL_RL_MODULES not in sys.path:
-    sys.path.insert(0, _RSL_RL_MODULES)
-
 
 VALID_SIM_TYPES = {"", "sim_actor", "sim_critic", "sim_both"}
 
@@ -391,9 +380,12 @@ class MultiTaskCritic(Critic):
 class MambaActor(nn.Module):
     """FastTD3 Actor with Mamba-2 backbone for temporal sequence modeling.
 
-    Reuses Mamba2Encoder from PPO-Mamba. The environment's frame-stacked obs
+    Reuses Mamba2Encoder from PPO-Mamba (single import identity:
+    rsl_rl.modules.mamba_encoder). The environment's frame-stacked obs
     (batch, seq_len * obs_dim) is reshaped into a sequence and processed by
-    Mamba-2 in parallel during training, then recursively during inference.
+    Mamba-2. Training and inference both run the full window in one parallel
+    scan (no incremental state recursion yet — full-window recompute at every
+    step; see docs/deploy_contract_mamba.md).
     """
 
     def __init__(
@@ -416,13 +408,25 @@ class MambaActor(nn.Module):
         device: torch.device = None,
     ):
         super().__init__()
-        from mamba_encoder import Mamba2Encoder
+        # 包内导入（T0.3-b）：与 actor_critic_mamba.py 同一模块身份，
+        # isinstance 跨调用点有效；不再经 sys.path hack 顶层导入。
+        from rsl_rl.modules.mamba_encoder import Mamba2Encoder
 
         self.n_act = n_act
         self.n_envs = num_envs
         self.seq_len = num_stack
         self.obs_dim = obs_dim
         self.device = device
+
+        # --- 防呆校验（T0.1）：滑窗扁平维度必须等于 num_stack * obs_dim ---
+        if num_stack <= 0:
+            raise ValueError(f"num_stack must be positive, got {num_stack}")
+        if n_obs != num_stack * obs_dim:
+            raise ValueError(
+                f"n_obs ({n_obs}) != num_stack * obs_dim ({num_stack} * {obs_dim}). "
+                f"The stacked observation dimension must match the frame-stacking "
+                f"window; check env num_stack and obs_dim configuration."
+            )
 
         # Mamba-2 encoder: processes (batch, seq_len, obs_dim) → (batch, d_model)
         self.mamba_encoder = Mamba2Encoder(
@@ -437,7 +441,11 @@ class MambaActor(nn.Module):
         if device is not None:
             self.mamba_encoder.to(device)
 
-        # MLP head: aligned with PPO-Mamba actor_hidden_dims=[256, 256, 128, 64]
+        # MLP head: [256, 256, 128, 64] —— T0.2 跨算法统一后的 Mamba actor 头容量，
+        # 与 PPO-Mamba（n1_config.py Mamba 模板 actor_hidden_dims=[256, 256, 128, 64]）
+        # 一致，保证 PPO vs FastTD3 的 Mamba 对比实验头容量对等。
+        # （宽度已统一；激活差异属算法约定：FastTD3 为 ReLU+tanh 输出压缩，
+        #   PPO 为 ELU+高斯均值，见配置注释。）
         self.fc_head = nn.Sequential(
             nn.Linear(mamba_d_model, 256, device=device),  # 128 → 256
             nn.ReLU(),

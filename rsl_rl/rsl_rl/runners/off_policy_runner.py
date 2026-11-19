@@ -250,6 +250,14 @@ class OffPolicyRunner:
 
         # --- Compile ---
         self._compile_enabled = self.fast_td3_cfg.get("compile", True)
+        # T0.3-e 实测（torch 2.4.1+cu121 / mamba_ssm）：torch.compile 与
+        # mamba_ssm Triton 算子不兼容——reduce-overhead 直接 BackendCompilerFailed，
+        # default 模式复跑出现 NameError（dynamo 代码生成缺陷）。
+        # 按方案对 Mamba 路径强制关闭 compile。
+        if self._compile_enabled and self.use_mamba:
+            print("[T0.3-e] torch.compile disabled for Mamba path "
+                  "(mamba_ssm Triton ops are incompatible with torch.compile)")
+            self._compile_enabled = False
         self._compiled = False
 
         # --- Algorithm hyperparams (cached for update loops) ---
