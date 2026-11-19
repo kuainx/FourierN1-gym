@@ -580,9 +580,11 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
     # PPO 策略开关（T0.1：显式设置即生效、误配即报错）
     #
     # 默认 = 基线 C：ActorCriticMLP（与历史 MLP run 行为一致）。
-    # 启用实验 D（PPO+Mamba2）必须「显式」改两处：
-    #   ① class_name = "ActorCriticMamba"（写在本 policy 类内，勿依赖继承/反注释）；
-    #   ② 取消下方 Mamba 键的注释（单层注释，取消即生效）。
+    # 注意：本类是「基线 C 与实验 D 共用的父类」，所以这里**不放**实验 D 的开关模板。
+    #   模板若在此处取消注释，mamba_* 会注入基线 C，触发 T0.1 的
+    #   「mamba 键误入 ActorCriticMLP 直接抛错」——即取消注释并不会「只启用 D」。
+    # 实验 D 的开关块放在真正被注册的类里（整块注释、含 class_name）：
+    #   n1_config_main_body.py :: N1MainBodyCfgPPO.policy
     # 防呆：seq_len 与 env.num_stack 不一致会在构造时直接抛错（T0.1）；
     #       mamba_* 键误入 ActorCriticMLP 也会直接抛错（不再静默回落）。
     # ============================================================
@@ -602,17 +604,6 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         decay_ratio = 1 - 2.0e-6
         decay_std_min = 0.1
 
-        # --- Mamba2 键（实验 D：PPO+Mamba，取消注释即启用，见顶部说明）---
-        # 校验：seq_len 必须 = env.num_stack（=20，见 n1_config_main_body.py）。
-        # mamba_d_model = 128          # Mamba 隐藏维度
-        # mamba_d_state = 16           # SSM 状态维度
-        # mamba_d_conv = 4             # 卷积宽度
-        # mamba_expand = 2             # 扩展因子
-        # mamba_n_layers = 2           # Mamba 层数
-        # mamba_headdim = 32           # 保持 nheads=8：headdim = d_model*expand//8（默认 64 使 nheads=4，
-        #                              #   触发 causal_conv1d channel-last stride 约束，非 Triton 约束，T0.3-d）
-        # seq_len = 20                 # 序列长度 = env.num_stack
-        # actor_hidden_dims = [256, 256, 128, 64]   # T0.2 跨算法统一（与 FastTD3-Mamba 头一致）
-        # critic_hidden_dims = [256, 128]           # PPO 特有；FastTD3 critic 为分布式 Q，不可比
-        # （历史 PPO-Mamba run 曾用 actor_hidden_dims=[256, 128]；R2：旧值仅供复现参考，
-        #   新对比实验一律用统一后的 [256, 256, 128, 64]。）
+        # --- Mamba2 开关模板已迁至 n1_config_main_body.py :: N1MainBodyCfgPPO.policy ---
+        # 原因：本 policy 类是基线 C 与实验 D 的共同父类，在此放模板会在取消注释时
+        # 把 mamba_* 注入基线 C（T0.1 直接报错）。实验 D 请在 main_body 里显式写。

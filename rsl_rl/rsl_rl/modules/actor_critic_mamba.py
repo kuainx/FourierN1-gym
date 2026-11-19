@@ -421,7 +421,10 @@ class ActorCriticMamba(ActorCriticMLP):
         actor_wrapper.eval()
 
         # 深拷贝后移到 CPU trace，避免影响原始模型的 CUDA 参数
-        actor_wrapper = copy.deepcopy(actor_wrapper).cpu()
+        # .float() 兜底：契约 §7 声明「导出恒 fp32」。Mamba2LayerJit 的 SSM 状态固定
+        # fp32，若权重是 bf16（AMP 真 bf16 / 手工 .to(bfloat16)），state 与 x_t 会 dtype
+        # 不匹配（einsum: float != c10::BFloat16），故导出前统一提升到 fp32。
+        actor_wrapper = copy.deepcopy(actor_wrapper).float().cpu()
 
         dummy_input = torch.zeros(1, self.seq_len * self.actor_obs_dim)
         traced_actor = torch.jit.trace(actor_wrapper, dummy_input)

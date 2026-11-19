@@ -18,6 +18,12 @@ compute_observation_profile 的 50 维单帧 obs 与下发动作写入 npz；
 重启/复位时在轨迹里插入 reset 标记（或分段存多条），对拍脚本按段补零重建窗。
 判据：同一初始状态、同一观测序列下动作差应 ≤ 漂移预算（fp32 自检 ~1e-6；
 AMP bf16 训练 checkpoint → fp32 导出的漂移属预期，量级记录即可）。
+
+严肃性约定（T1.3 修订）：
+  - 给 --ckpt 时：actor 权重必须 0 missing / 0 unexpected，且必须能读到
+    `obs_normalizer_state_dict`，否则直接 SystemExit —— 不做「静默降级」；
+  - 不给 --ckpt 时：权重与归一化统计都是随机的，两条链路共用同一份，
+    diff 天然接近 0，输出会带 [SELF-TEST] 标记，**不计入验收**。
 """
 import argparse
 import os
@@ -59,8 +65,29 @@ def rebuild_windows(obs_raw: torch.Tensor, resets=None):
     return out
 
 
-def load_actor(ckpt_path, device):
-    """从 FastTD3 checkpoint 恢复 MambaActor；无 checkpoint 用随机初始化。"""
+def read_ckpt(path):
+    """读一次 checkpoint，返回 (actor_state_dict, obs_normalizer_state_dict|None)。
+
+    字段名与 OffPolicyRunner.save 一致：`actor_state_dict` / `obs_normalizer_state_dict`。
+    """
+    state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise SystemExit(f"{path}: 期望 dict，实得 {type(state).__name__}")
+    actor_sd = state.get("actor_state_dict", state.get("model_state_dict"))
+    if actor_sd is None:
+        actor_sd = state            # 直接存了 actor 的 state_dict
+    # 兼容 qnet/actor 共用命名前缀的情况
+    actor_sd = {k.split("actor.", 1)[-1] if k.startswith("actor.") else k: v
+                for k, v in actor_sd.items()}
+    return actor_sd, state.get("obs_normalizer_state_dict")
+
+
+def load_actor(ckpt_path, device, actor_sd=None):
+    """从 FastTD3 checkpoint 恢复 MambaActor；无 checkpoint 用随机初始化。
+
+    有权重时按「错配即失败」处理：权重名对不上必须报错，否则会退化成
+    「两条链路共用同一份权重、diff 天然为 0」的假通过。
+    """
     from fast_td3.fast_td3 import MambaActor
     actor = MambaActor(
         n_obs=FLAT, n_act=N_ACT, num_envs=4, init_scale=0.01,
@@ -70,17 +97,43 @@ def load_actor(ckpt_path, device):
         device=device,
     ).to(device)
     if ckpt_path:
-        state = torch.load(ckpt_path, map_location=device)
-        sd = state.get("model_state_dict", state.get("actor_state_dict", state))
-        sd = {k.split("actor.", 1)[-1] if k.startswith("actor.") else k: v
-              for k, v in sd.items()}
-        missing, unexpected = actor.load_state_dict(sd, strict=False)
-        print(f"loaded actor from {ckpt_path} "
-              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        if actor_sd is None:
+            actor_sd, _ = read_ckpt(ckpt_path)
+        missing, unexpected = actor.load_state_dict(actor_sd, strict=False)
+        if missing or unexpected:
+            raise SystemExit(
+                "checkpoint 权重与 MambaActor 结构不匹配，拒绝继续对拍：\n"
+                f"  missing({len(missing)})       = {list(missing)[:5]}\n"
+                f"  unexpected({len(unexpected)}) = {list(unexpected)[:5]}"
+            )
+        print(f"loaded actor from {ckpt_path} (missing=0, unexpected=0)")
     else:
-        print("no --ckpt given: using random-init actor (pipeline self-test)")
+        print("no --ckpt given: using random-init actor（仅 pipeline 自检，不计入验收）")
     actor.eval()
     return actor
+
+
+def build_norm(ckpt_path, device, norm_sd=None):
+    """归一化：优先用 checkpoint 的训练侧统计；有 ckpt 但缺统计即报错。"""
+    from fast_td3.fast_td3_utils import EmpiricalNormalization
+    norm = EmpiricalNormalization(shape=FLAT, device=device)
+    if ckpt_path:
+        if norm_sd is None:
+            _, norm_sd = read_ckpt(ckpt_path)
+        if norm_sd is None:
+            raise SystemExit(
+                f"{ckpt_path} 内没有 obs_normalizer_state_dict，无法复现训练侧归一化；"
+                "请使用 OffPolicyRunner.save 产出的 checkpoint。"
+            )
+        norm.load_state_dict(norm_sd)
+        print("loaded obs_normalizer from checkpoint")
+    else:
+        norm.train()
+        with torch.no_grad():
+            norm(torch.randn(64, FLAT, device=device))
+        print("WARNING: 无 ckpt，归一化用随机统计（仅 pipeline 自检，不计入验收）")
+    norm.eval()
+    return norm
 
 
 def build_export(actor, norm, device):
@@ -106,6 +159,11 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        raise SystemExit(
+            "本脚本需要 CUDA：Python 参考链 actor() 走 mamba_ssm 的 Triton 融合路径"
+            "（causal_conv1d_cuda），在 CPU 上会报 Expected x.is_cuda()。"
+        )
     torch.manual_seed(3)
 
     # --- 观测序列 ---
@@ -129,13 +187,9 @@ def main():
     windows = rebuild_windows(obs_raw, resets)     # (T, 1000) 部署侧窗重建
 
     # --- 两条链路 ---
-    actor = load_actor(args.ckpt, device)
-    from fast_td3.fast_td3_utils import EmpiricalNormalization
-    norm = EmpiricalNormalization(shape=FLAT, device=device)
-    norm.train()
-    with torch.no_grad():
-        norm(torch.randn(64, FLAT, device=device))   # 随机统计（ckpt 自带统计时可替换）
-    norm.eval()
+    actor_sd, norm_sd = read_ckpt(args.ckpt) if args.ckpt else (None, None)
+    actor = load_actor(args.ckpt, device, actor_sd)
+    norm = build_norm(args.ckpt, device, norm_sd)
 
     if args.jit:
         traced = torch.jit.load(args.jit).to(device).eval()
@@ -155,8 +209,8 @@ def main():
     print(f"steps={diffs.numel()}  max|diff|={diffs.max().item():.3e}  "
           f"mean|diff|={diffs.mean().item():.3e}  (drift budget {TOL_DRIFT:.0e})")
     ok = diffs.max().item() < TOL_DRIFT
-    print("RESULT:", "PASS" if ok else "FAIL",
-          "（真实 AMP checkpoint 的漂移可超预算，量级记录在案即可）")
+    tag = "" if args.ckpt else "  [SELF-TEST: 无 checkpoint，只验证导出管线，不计入验收]"
+    print("RESULT:", "PASS" if ok else "FAIL", tag)
     sys.exit(0 if ok else 1)
 
 

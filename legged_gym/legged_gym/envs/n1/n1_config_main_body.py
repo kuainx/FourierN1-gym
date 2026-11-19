@@ -241,3 +241,27 @@ class N1MainBodyCfgPPO(N1BaseCfgPPO, N1MainBodyCfg):
 
     class policy(N1BaseCfgPPO.policy):
         init_noise_std = [0.2] * N1MainBodyCfg.env.num_actions
+
+        # ============================================================
+        # 实验 D 开关块（PPO + Mamba2）。本类才是任务 N1 实际注册的 policy 类，
+        # 因此开关放在这里：整块取消注释 = 本次 run 切到 D 组，跑完必须还原
+        # （同一时刻 C/D 不共存，基线 C 用默认的 MLP 头）。
+        # 若在父类 n1_config.py::N1CfgPPO.policy 放模板，取消注释会把 mamba_*
+        # 注入基线 C 并触发 T0.1「mamba 键误入 MLP」抛错——已按此原因迁出。
+        # 判据：seq_len 必须 = env.num_stack（T0.1 构造时断言）。
+        # headdim 规则：保持 nheads = d_model*expand/headdim = 8，
+        #   即 headdim = d_model*expand//8（128→32、96→24、192→48）；
+        #   违反时触发 causal_conv1d channel-last stride 约束（T0.3-d）。
+        # ============================================================
+        # class_name = "ActorCriticMamba"
+        # actor_hidden_dims = [256, 256, 128, 64]   # T0.2 跨算法统一（与 FastTD3-Mamba 头一致）
+        # critic_hidden_dims = [256, 128]           # PPO 特有；FastTD3 critic 为分布式 Q，不可比
+        # seq_len = 20                              # 必须 = env.num_stack
+        # mamba_d_model = 128                       # Mamba 隐藏维度
+        # mamba_d_state = 16                        # SSM 状态维度
+        # mamba_d_conv = 4                          # 卷积宽度
+        # mamba_expand = 2                          # 扩展因子
+        # mamba_n_layers = 2                        # Mamba 层数
+        # mamba_headdim = 32                        # = d_model*expand//8
+        # （历史 PPO-Mamba run 曾用 actor_hidden_dims=[256, 128]；旧值仅供复现参考，
+        #   新对比实验一律用统一后的 [256, 256, 128, 64]。）

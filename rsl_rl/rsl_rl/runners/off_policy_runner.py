@@ -1194,7 +1194,7 @@ class OffPolicyRunner:
         else:
             policy.obs_normalizer = nn.Identity()
 
-        policy = policy.cpu().eval()
+        policy = policy.float().cpu().eval()
         scripted = torch.jit.script(policy)
         scripted.save(path)
         print(f"Saved JIT policy to {path}")
@@ -1257,8 +1257,10 @@ class OffPolicyRunner:
             n_obs=seq_len * obs_dim,
         )
 
-        # Deep copy to CPU to avoid affecting the CUDA model
-        policy = copy.deepcopy(policy).cpu().eval()
+        # Deep copy to CPU to avoid affecting the CUDA model.
+        # .float(): 契约 §7 声明导出恒 fp32；Mamba2LayerJit 的 SSM 状态固定 fp32，
+        # 权重若是 bf16 会 dtype 不匹配（einsum: float != c10::BFloat16）。
+        policy = copy.deepcopy(policy).float().cpu().eval()
 
         # Trace with dummy input
         dummy = torch.zeros(1, seq_len * obs_dim)
