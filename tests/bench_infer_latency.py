@@ -101,7 +101,8 @@ def main():
         print(f"RESULT: PASS —— 时延低于预算，T1.5 增量导出转可选项")
     else:
         print(f"RESULT: OVER BUDGET —— T1.5 增量 step 导出升为必做")
-    sys.exit(0)
+    # 退出码即门禁：超预算返回 1，可被 CI / run_gpu_checks.sh 直接判定
+    sys.exit(0 if mean_ms < BUDGET_MS else 1)
 
 
 if __name__ == "__main__":

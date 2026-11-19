@@ -16,10 +16,10 @@
 | 项 | 约定 |
 |---|---|
 | 输入 | `obs_flat`，float32，形状 `(batch, 1000)` = 20 帧 × 50 维滑窗展平 |
-| 输出 | `action`，float32，形状 `(batch, 13)`，tanh 归一化关节动作（[-1, 1]） |
+| 输出 | `action`，float32，形状 `(batch, 13)`。量程**随算法不同**：FastTD3+MambaActor 末端有 `nn.Tanh()` → `[-1,1]`；PPO+ActorCriticMamba 为线性头（正态均值），**无 [-1,1] 保证**，部署端不得再套 tanh（见 §4） |
 | 控制频率 | 50 Hz（`sim.dt=0.005 × decimation=4` → 20 ms/步） |
 | 推理模式 | **全窗推理**：每控制步重算整窗（2 层 × 20 步顺序 SSM）；无增量状态缓存 |
-| 归一化 | `EmpiricalNormalization` 统计（1000 维整窗）已烘焙进导出图（eval 模式）；部署端**不得**再做归一化或反归一化 |
+| 归一化 | 两条链路**都不要求**部署端做归一化/反归一化，但原因不同：<br>• **FastTD3**：训练用 `EmpiricalNormalization`（1000 维整窗统计），已**烘焙进导出图**（`_save_jit_mamba`，eval 模式）；<br>• **PPO**：全程**没有**归一化——`on_policy_runner` 无 normalizer、env 只做 `obs_scales` 手工缩放，导出图里不存在任何 norm 节点。 |
 | batch 维 | 不固化（torch 2.4.1 实测 batch=1/8 均可）；但 **窗长 20 被 trace 固化**，不可改 |
 
 ---
@@ -52,15 +52,39 @@
 | 3 | `base_projected_gravity × obs_scales.gravity` | 3 | `1.0` | 重力在机体系投影 |
 | 4 | `dof_pos_offset × obs_scales.dof_pos` | 13 | `1.0` | 关节相对默认姿态的偏移（左腿 6 + 右腿 6 + 腰 1） |
 | 5 | `dof_vel × obs_scales.dof_vel` | 13 | `0.10` | 关节角速度 |
-| 6 | `actions × obs_scales.action` | 13 | `1.0` | **上一步下发的动作**（tanh 输出 × action_scale 后），首步为 0 |
+| 6 | `actions × obs_scales.action` | 13 | `1.0` | **上一步网络原始输出**（仅经 `clip_actions=±100`，实际不触发；**未乘** `action_scale`），首步为 0 |
 | 7 | `swing_clock` | 2 | 无 | 步态时钟，须按训练同款口径生成（见下） |
 
 要点：
 
-- **`actions` 是上一步动作**（×action_scale 之后的关节指令值，不是网络原始 tanh 输出）；
+- **`actions` 是上一步网络原始输出**，只经过 `clip_actions`（`normalization.clip_actions=100`，
+  `legged_robot_code.py:260-261` 取的是其对称值，**不是**配置里的 `clip_actions_max/min` 数组），
+  **没有乘 `action_scale`**（`_compute_torques` 里的 `actions_scaled` 是局部变量，不回写
+  `self.actions`，`legged_robot_code.py:1647`）。N1 全关节 `action_scale=1`（`n1_config.py:284-303`）
+  所以两者数值相同，但**语义必须按“未缩放”理解**：一旦修改 `action_scale`，obs 第 6 段仍是未缩放值。
   复位后第一步该分量为 0。
-- **`swing_clock`** 为步态时钟（2 维），部署端必须按训练侧同款公式/相位约定生成；
-  stand/walk 任务差异由 `commands` 与 `swing_clock` 承载，不得自造时钟口径。
+- **`swing_clock`** 为步态时钟（2 维），stand/walk 任务差异由 `commands` 与 `swing_clock`
+  承载，不得自造时钟口径。训练侧唯一实现：`legged_robot_fftai_code.py:139-150`
+  （stand 判定见 `n1_code.py:135-146`），逐行复刻如下（`dt = sim.dt × decimation = 0.02 s`）：
+
+  ```
+  phase = n * dt / 0.9                  # 周期 0.9 s = 45 控制步；n = episode 内已过步数
+  s     = sin(2 * pi * phase)
+  c_l   = -s  if s <= -0.10 else 0.0    # 分量 0：左腿
+  c_r   =  s  if s >=  0.10 else 0.0    # 分量 1：右腿
+  swing_clock = [c_l, c_r]              # 两分量恒 ≥ 0，交替脉冲
+
+  if ||commands[0:2]|| <= 0.10 and abs(commands[2]) <= 0.10:   # stand 指令
+      swing_clock = [0.0, 0.0]
+  ```
+
+  **两处时序细节必须一致**（否则整窗输入偏一步）：
+  - `n` 在本步 `post_physics_step` 开头先自增、随后才算时钟（`legged_robot_code.py:779→782`），
+    故复位后的第 1 个控制步用 `n = 1`，`phase = 0.0222` 而非 0；
+  - `reset_idx` 在时钟算完之后才把 `n` 清零（`:790`），且 `compute_observations` 更晚（`:797`），
+    所以**复位后首帧观测里的 `swing_clock` 是上一步（终止时刻）的旧值**，不是 `[0,0]`。
+    部署端若在复位时直接置零，首帧会有 1 步相位偏差（20 ms）。
+  - stand 判定用的是**未缩放的原始指令**（`commands_scale` 不参与该判定）。
 - `dof_pos` 用的是 **offset**（相对默认姿态），不是绝对关节角。
 - 各分量的物理量单位均为国际单位制。**缩放系数必须取自本次训练使用的配置**：
   N1 在 `n1_config.py:495-503` 覆盖了 `normalization.obs_scales`
@@ -73,7 +97,12 @@
 
 ## 4. 动作还原
 
-1. 模型输出 `action ∈ [-1, 1]^{13}`（tanh 归一化动作，关节顺序与观测中 dof 一致）。
+1. 模型输出 `action`（13 维，关节顺序与观测中 dof 一致）。量程随算法而定：
+   - **FastTD3**：末端 `nn.Tanh()`，`action ∈ [-1,1]^13`，直接乘 `action_scale`；
+   - **PPO**：线性输出层（正态分布的均值），**不在 [-1,1] 内**，训练与部署都不做 tanh、
+     也不做额外 clip（`clip_actions=100` 实际不触发）。部署 PPO 导出物时若补一层 tanh，
+     等于给策略加训练时不存在压缩，属破坏性偏差。可否越界取决于训练收敛结果，
+     部署端**不得**假设动作有界。
 2. 部署端按训练配置还原关节指令：
    `joint_target = default_dof_pos + action × action_scale`（position 控制），
    再由 PD 控制器（训练同款 **PD 增益**）跟踪。

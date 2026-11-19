@@ -1,6 +1,10 @@
 """M0 验收冒烟：T0.1/T0.3 防呆断言行为检查（不含训练）。"""
+import copy
+import os
 import sys
-sys.path.insert(0, "/home/mao/N1/rsl_rl")
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "rsl_rl"))
 
 import torch
 from rsl_rl.modules.actor_critic_mamba import ActorCriticMamba
@@ -123,8 +127,28 @@ jit_layer = Mamba2LayerJit(layer)
 
 
 def run_rmsnorm_false():
-    out = jit_layer(torch.randn(2, 5, 128))
+    x = torch.randn(2, 5, 128)
+    out = jit_layer(x)
     assert out.shape == (2, 5, 128), out.shape
+
+    # T0.3-c 数值断言（不只比 shape）：z 必须真的参与门控。
+    # 依据 Mamba2 语义 y = out_proj(u) * silu(z)：把 in_proj 的 z 段权重置零 → z=0
+    # → silu(0)=0 → 整层输出恒 0；若实现丢了 z（y = out_proj(u)），置零后输出不变。
+    d_ssm, ng, nh = layer.d_ssm, layer.ngroups, layer.nheads
+    d_mlp = (layer.in_proj.out_features - 2 * d_ssm
+             - 2 * ng * layer.d_state - nh) // 2
+    z_slice = slice(2 * d_mlp, 2 * d_mlp + d_ssm)
+    zeroed = copy.deepcopy(jit_layer)
+    with torch.no_grad():
+        zeroed.in_proj.weight[z_slice] = 0
+        if zeroed.in_proj.bias is not None:
+            zeroed.in_proj.bias[z_slice] = 0
+        out_zero = zeroed(x)
+
+    assert out.abs().max() > 1e-3, f"reference output collapsed: {out.abs().max():.2e}"
+    assert out_zero.abs().max() < 1e-6, (
+        "z gate not applied: with z=0 the layer output must be 0, got "
+        f"max|y|={out_zero.abs().max():.2e}")
 
 
 expect_ok("T0.3-c rmsnorm=False forward", run_rmsnorm_false)

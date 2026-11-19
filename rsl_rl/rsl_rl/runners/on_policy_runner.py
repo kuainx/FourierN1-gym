@@ -81,9 +81,12 @@ class OnPolicyRunner:
         actor_critic_class = eval(self.policy_cfg["class_name"])
 
         # T0.1 防呆：把 env.num_stack 传给 policy，Mamba 策略构造时校验
-        # seq_len == num_stack（MLP 策略经 **kwargs 忽略该键）。
+        # seq_len == num_stack。仅 Mamba 策略需要该键；MLP 基线若收到它会走
+        # **kwargs 打印「unexpected arguments」噪音（class_name 同理，一律剔除）。
         policy_kwargs = dict(self.policy_cfg)
-        policy_kwargs.setdefault("num_stack", getattr(self.env, "num_stack", None))
+        policy_kwargs.pop("class_name", None)
+        if self.policy_cfg["class_name"] == "ActorCriticMamba":
+            policy_kwargs.setdefault("num_stack", getattr(self.env, "num_stack", None))
 
         actor_critic: ActorCriticMLP = actor_critic_class(actor_num_input,
                                                           critic_num_input,
