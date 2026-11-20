@@ -102,8 +102,10 @@ class Mamba2LayerJit(nn.Module):
             D = D.view(self.nheads, 1)
 
         # 顺序 SSM 扫描（替代 Triton 块扫描）
-        state = torch.zeros(batch, self.nheads, self.headdim, self.d_state,
-                            device=u.device, dtype=torch.float32)
+        # 用 u.new_zeros 保证 trace 后设备随输入动态确定
+        # （torch.zeros 会在 trace 时把 CPU 设备烘焙进图，导出模型上 GPU 会报设备错）
+        state = u.new_zeros(batch, self.nheads, self.headdim, self.d_state,
+                            dtype=torch.float32)
 
         outputs = []
         for t in range(seqlen):
@@ -129,6 +131,10 @@ class Mamba2LayerJit(nn.Module):
 
         if self.rmsnorm:
             y = self._rms_norm_gated(y, z)
+        else:
+            # rmsnorm=False 时 Mamba2 语义为门控输出 y * silu(z)
+            # （与 mamba_ssm 官方 Mamba2.forward 一致，避免 z 被静默丢弃）
+            y = y * F.silu(z)
 
         if d_mlp > 0:
             y = torch.cat([F.silu(z0) * x0, y], dim=-1)
@@ -190,6 +196,7 @@ class ActorCriticMamba(ActorCriticMLP):
                  mamba_headdim=64,
                  mamba_n_layers=2,
                  seq_len=10,
+                 num_stack=None,
                  **kwargs):
         """
         Args:
@@ -208,7 +215,9 @@ class ActorCriticMamba(ActorCriticMLP):
             mamba_expand: 扩展因子
             mamba_headdim: 头维度
             mamba_n_layers: Mamba 层数
-            seq_len: 序列长度
+            seq_len: 序列长度（须与 env 的 num_stack 一致）
+            num_stack: env 的堆叠帧数（runner 侧传入，用于校验 seq_len；
+                不传则跳过一致性校验，仅做整除校验）
         """
         print("----------------------------------")
         print("ActorCriticMamba")
@@ -216,6 +225,22 @@ class ActorCriticMamba(ActorCriticMLP):
         print(f"critic_num_input: {critic_num_input}")
         print(f"actor_num_output: {actor_num_output}")
         print("----------------------------------")
+
+        # --- 防呆校验（T0.1）：误配即报错，杜绝静默整除/错位 ---
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {seq_len}")
+        if actor_num_input % seq_len != 0:
+            raise ValueError(
+                f"actor_num_input ({actor_num_input}) must be divisible by "
+                f"seq_len ({seq_len}). seq_len must equal env num_stack "
+                f"(currently the observation window is num_stack frames)."
+            )
+        if num_stack is not None and seq_len != num_stack:
+            raise ValueError(
+                f"policy seq_len ({seq_len}) != env num_stack ({num_stack}). "
+                f"The Mamba sequence length must match the frame-stacking window; "
+                f"set policy.seq_len = env.num_stack (e.g. 20) in the config."
+            )
 
 
         # 调用父类构造函数（仅用于初始化基本参数，不使用其 MLP）
@@ -396,7 +421,10 @@ class ActorCriticMamba(ActorCriticMLP):
         actor_wrapper.eval()
 
         # 深拷贝后移到 CPU trace，避免影响原始模型的 CUDA 参数
-        actor_wrapper = copy.deepcopy(actor_wrapper).cpu()
+        # .float() 兜底：契约 §7 声明「导出恒 fp32」。Mamba2LayerJit 的 SSM 状态固定
+        # fp32，若权重是 bf16（AMP 真 bf16 / 手工 .to(bfloat16)），state 与 x_t 会 dtype
+        # 不匹配（einsum: float != c10::BFloat16），故导出前统一提升到 fp32。
+        actor_wrapper = copy.deepcopy(actor_wrapper).float().cpu()
 
         dummy_input = torch.zeros(1, self.seq_len * self.actor_obs_dim)
         traced_actor = torch.jit.trace(actor_wrapper, dummy_input)

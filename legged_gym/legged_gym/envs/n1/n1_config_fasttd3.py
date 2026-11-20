@@ -110,7 +110,9 @@ class N1MainBodyCfgFastTD3(N1MainBodyCfg):
         mamba_d_state = 16             # SSM state dimension
         mamba_d_conv = 4               # convolution width
         mamba_expand = 2               # expansion factor
-        mamba_headdim = 32             # head dimension (d_model * expand / headdim must be multiple of 8)
+        mamba_headdim = 32             # head dim; keep nheads = d_model*expand/headdim = 8 (headdim = d_model*expand//8).
+                                       # Constraint (T0.3-d): in_proj out dim 2*d_model*expand + 2*d_state + nheads
+                                       # must be a multiple of 8 (causal_conv1d channel-last stride).
         mamba_n_layers = 2             # number of Mamba layers
 
     class rewards(N1MainBodyCfg.rewards):

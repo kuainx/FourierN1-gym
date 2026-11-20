@@ -576,37 +576,25 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         # storage class
         storage_class = "RolloutStorage"
 
-    # class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-    #     class_name = "ActorCriticMLP"
-
-    #     # policy params
-    #     actor_hidden_dims = [1024, 512, 256, 128]
-    #     critic_hidden_dims = [1024, 512, 256, 128]
-    #     activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
-    #     init_weights = False
-
-    #     fixed_std = False
-    #     init_noise_std = [0.2] * N1Cfg.env.num_actions
-
-    #     decay_std = False
-    #     decay_ratio = 1 - 2.0e-6
-    #     decay_std_min = 0.1
+    # ============================================================
+    # PPO 策略开关（T0.1：显式设置即生效、误配即报错）
+    #
+    # 默认 = 基线 C：ActorCriticMLP（与历史 MLP run 行为一致）。
+    # 注意：本类是「基线 C 与实验 D 共用的父类」，所以这里**不放**实验 D 的开关模板。
+    #   模板若在此处取消注释，mamba_* 会注入基线 C，触发 T0.1 的
+    #   「mamba 键误入 ActorCriticMLP 直接抛错」——即取消注释并不会「只启用 D」。
+    # 实验 D 的开关块放在真正被注册的类里（整块注释、含 class_name）：
+    #   n1_config_main_body.py :: N1MainBodyCfgPPO.policy
+    # 防呆：seq_len 与 env.num_stack 不一致会在构造时直接抛错（T0.1）；
+    #       mamba_* 键误入 ActorCriticMLP 也会直接抛错（不再静默回落）。
+    # ============================================================
     class policy(LeggedRobotFFTAIBipedalCfgPPO.policy):
-        class_name = "ActorCriticMamba"  # 切换为 Mamba 版本
+        class_name = "ActorCriticMLP"  # 基线 C；实验 D 显式改为 "ActorCriticMamba"
 
-        # Mamba 参数
-        mamba_d_model = 128          # Mamba 隐藏维度
-        mamba_d_state = 16           # SSM 状态维度
-        mamba_d_conv = 4             # 卷积宽度
-        mamba_expand = 2             # 扩展因子
-        mamba_n_layers = 2           # Mamba 层数
-        mamba_headdim = 32           # d_model * expand / headdim = multiple of 8
-        seq_len = 20                 # 序列长度
-
-        # policy params
-        actor_hidden_dims = [256, 128]      # 可适当减小，因为 Mamba 已提取特征
-        critic_hidden_dims = [256, 128]
-        activation = "elu"
+        # policy params（MLP 基线头容量，与历史 MLP run 一致）
+        actor_hidden_dims = [1024, 512, 256, 128]
+        critic_hidden_dims = [1024, 512, 256, 128]
+        activation = "elu"  # can be elu, relu, selu, crelu, lrelu, tanh, sigmoid
         init_weights = False
 
         fixed_std = False
@@ -615,3 +603,7 @@ class N1CfgPPO(LeggedRobotFFTAIBipedalCfgPPO, N1Cfg):
         decay_std = False
         decay_ratio = 1 - 2.0e-6
         decay_std_min = 0.1
+
+        # --- Mamba2 开关模板已迁至 n1_config_main_body.py :: N1MainBodyCfgPPO.policy ---
+        # 原因：本 policy 类是基线 C 与实验 D 的共同父类，在此放模板会在取消注释时
+        # 把 mamba_* 注入基线 C（T0.1 直接报错）。实验 D 请在 main_body 里显式写。

@@ -42,6 +42,16 @@ class ActorCriticMLP(nn.Module):
         print("----------------------------------")
         print("ActorCriticMLP")
 
+        # --- 防呆校验（T0.1）：Mamba 配置键误入 MLP 即报错，杜绝静默回落 ---
+        mamba_keys = [k for k in kwargs if k.startswith("mamba_") or k == "seq_len"]
+        if mamba_keys:
+            raise ValueError(
+                f"ActorCriticMLP got Mamba-specific config keys {mamba_keys}, but "
+                f"class_name is ActorCriticMLP. The Mamba switch did not take effect — "
+                f"explicitly set class_name = \"ActorCriticMamba\" in the policy config "
+                f"(see n1_config.py policy section)."
+            )
+
         if kwargs:
             print("ActorCriticMLP.__init__ got unexpected arguments, which will be ignored: "
                   + str([key for key in kwargs.keys()]))
