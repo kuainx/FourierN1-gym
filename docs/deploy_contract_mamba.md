@@ -1,13 +1,14 @@
 # Mamba2 策略部署契约（deploy contract）
 
-- 版本：v1（2026-11-19，随实施方案 outputs/Mamba2实施方案.md 阶段 1/T1.1 固化）
+- 版本：v1（2026-11-19，M1 部署接口固化）
 - 适用导出物：`policy_jit.pt`（`save_jit` / `_save_jit_mamba` 产出，TorchScript trace 模型）
 - 适用模型：FastTD3 + MambaActor 与 PPO + ActorCriticMamba 两条链路的 Mamba2 策略
   （MLP 基线的窗/观测契约与本文件一致，仅网络结构不同）
 - **发布约定**：每次导出 `policy_jit.pt` 时，必须与本契约的版本号一并交付；
   契约与导出物不同版号不得混用。任何观测顺序/缩放/窗长/归一化变更都视为
   **破坏性变更**：必须重训 + 重导出 + 本契约升版。
-- 依据：`outputs/Mamba2使用审查报告.md` §3.4（部署契约草案）、§3.0–§3.5（部署侧审查）。
+- 依据：Mamba2 训练/导出链路代码审查与数值对拍；结论已固化于本文与
+  `tests/test_mamba_export_parity.py`。
 
 ---
 
@@ -150,20 +151,20 @@
    在部署端运行导出模型，与 Python 策略输出逐位/近逐位比对（含归一化）。
    本档走**漂移档 5e-4**（部署端递推顺序与训练并行扫描不同）；
    若部署端也按顺序扫描复现，可要求严格档 1e-5。
-   AMP bf16 训练 → fp32 导出的漂移属预期，量级记录在案即可
-   （可参考 `tests/run_traj_parity.py`，注意须加载 checkpoint 内的
-   `obs_normalizer_state_dict`，不要用随机统计）。
+   AMP bf16 训练 → fp32 导出的漂移属预期，量级记录在案即可。
+   对拍时须加载 checkpoint 内的 `obs_normalizer_state_dict`，不要用随机统计。
 
 ## 8. 已知限制（本版契约）
 
-1. **全窗推理时延**：每控制步重算 20 步顺序 SSM。目标硬件（如 Jetson）单步时延
-   需实测（T1.4）；若超 20 ms 预算，须实施增量 `step()` 导出改造（T1.5，
-   以官方 `Mamba2.step` + `allocate_inference_cache` 为参照，注意复位清状态
-   与窗外衰减尾巴两个语义点）。
+1. **全窗推理时延**：每控制步重算 20 步顺序 SSM。本机参考实测（RTX 4090 / fp32 /
+   随机初始化策略）：单次前向 **4.5 ms**（低于 50 Hz 的 20 ms 预算）；
+   x86 CPU **49.6 ms**（超预算）。目标硬件（如 Jetson）仍须实测；
+   若超 20 ms 预算，须实施增量 `step()` 导出改造，以官方 `Mamba2.step` +
+   `allocate_inference_cache` 为参照，注意复位清状态与窗外衰减尾巴两个语义点。
 2. **终止步观测语义**：训练侧终止转移存入的是清零窗（已知取舍，两条链路一致）；
    部署时输入窗恒含真实最新帧，无影响。
 3. torch 版本迁移（非 2.4.1）时，trace 的 batch 维行为须重测（用例 c）。
-4. **Mamba 头维度约束（T0.3-d，A1 修订）**：约束来自 `causal_conv1d` 的 channel-last
+4. **Mamba 头维度约束**：约束来自 `causal_conv1d` 的 channel-last
    布局，不是 Triton。融合路径里 conv 的输入是 `zxbcdt` 的切片视图
    （`mamba_ssm/ops/triton/ssd_combined.py:964-965`），其通道 stride 等于 in_proj 输出维
    `D = 2*d_model*expand + 2*ngroups*d_state + nheads`，而 `causal_conv1d` 要求
@@ -191,4 +192,4 @@
 - [ ] 无额外观测 clip（§5）
 - [ ] 归一化未重复施加（§0/§6）
 - [ ] 轨迹级对拍通过（§7，档位 5e-4 与 diff 量级已记录）
-- [ ] 单步时延 < 20 ms 预算（或已立项 T1.5 增量导出）
+- [ ] 单步时延 < 20 ms 预算（否则需实施增量 `step()` 导出）

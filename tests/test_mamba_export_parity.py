@@ -1,13 +1,13 @@
-"""T1.2 自动化数值对拍单测：训练前向 vs 导出复现（Mamba2 链路）。
+"""训练前向 vs 导出复现数值对拍单测（Mamba2 链路）。
 
-实施方案 outputs/Mamba2实施方案.md 阶段 1/T1.2 三用例（含 case c batch 回归）：
+用例（判据同 docs/deploy_contract_mamba.md §7，含 batch=1/8 回归）：
 
   a1. Mamba2EncoderJit（导出复现） vs 官方 Mamba2.step 逐帧递推
-      —— 导出物正确性主判据，严格 1e-5（实测 ~7e-7，复现审查报告 §4 实验 1）
+      —— 导出物正确性主判据，严格 1e-5（实测 ~8e-7）
   a2. Mamba2Encoder（Triton 训练前向） vs Mamba2EncoderJit
       —— 并行扫描 vs 顺序扫描的 fp32 累序漂移，预算 5e-4
-      （实测层 1.3e-4 / 编码器 5e-5；计划文档判据 1e-5 系参照
-        Jit-vs-step 基线 4.77e-07 所定，对本对比过严，见附录 C 修订记录）
+      （实测层 1.3e-4 / 编码器 5e-5；1e-5 系 Jit-vs-step 基线 4.77e-07
+        所定，对并行-vs-顺序对比过严，故按契约 §7 改用 5e-4 漂移预算）
   b1. 端到端：eager 导出包装（含归一化烘焙） vs traced —— trace/烘焙保真，严格 1e-5
   b2. 端到端：actor(norm_obs)（Triton 训练链） vs traced —— 训练→部署总漂移，预算 5e-4
       （两条链路均走真实导出代码：PPO save_jit / FastTD3 _save_jit_mamba）
@@ -15,7 +15,7 @@
 
 用法（n1 conda 环境）：
     /home/mao/.conda/envs/n1/bin/python tests/test_mamba_export_parity.py
-后续阶段 4 的任何前向改动，必须先过本单测（合入门槛，方案 §7 前置）。
+任何涉及 Mamba 前向/导出路径的改动，必须先过本单测。
 """
 import os
 import sys
@@ -64,7 +64,7 @@ def build_encoder():
 
 
 def step_reference(layer, u):
-    """官方 Mamba2.step 逐帧递推（审查报告 §4 实验 1 同口径）。"""
+    """官方 Mamba2.step 逐帧递推（契约 §7 同口径）。"""
     batch, seqlen, _ = u.shape
     conv_state, ssm_state = layer.allocate_inference_cache(
         batch, seqlen, dtype=u.dtype)
@@ -102,7 +102,7 @@ def case_b_ppo():
     torch.manual_seed(1)
     ac = ActorCriticMamba(
         actor_num_input=FLAT, critic_num_input=183, actor_num_output=N_ACT,
-        actor_hidden_dims=[256, 256, 128, 64],  # T0.2 统一头容量
+        actor_hidden_dims=[256, 256, 128, 64],  # 两链路统一头容量
         seq_len=SEQ_LEN, num_stack=SEQ_LEN,
         mamba_d_model=128, mamba_d_state=16, mamba_d_conv=4,
         mamba_expand=2, mamba_headdim=32, mamba_n_layers=2,
