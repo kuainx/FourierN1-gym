@@ -133,6 +133,8 @@ def get_load_path(root, load_run=-1, checkpoint=-1, play=False):
         model = "model_{}.pt".format(checkpoint)
 
     load_path = os.path.join(load_run, model)
+    if not os.path.exists(load_path):
+        raise FileNotFoundError(f"Checkpoint not found: {load_path}")
     return load_path
 
 
@@ -158,6 +160,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.runner.load_run = args.load_run
         if args.checkpoint is not None:
             cfg_train.runner.checkpoint = args.checkpoint
+        if getattr(args, "iter", None) is not None:
+            cfg_train.runner.checkpoint = args.iter
 
     return env_cfg, cfg_train
 
@@ -170,6 +174,7 @@ def get_args():
         {"name": "--run_name", "type": str, "help": "Name of the run. Overrides config file if provided."},
         {"name": "--load_run", "type": str, "help": "Name of the run to load when resume=True. If -1: will load the last run. Overrides config file if provided."},
         {"name": "--checkpoint", "type": int, "help": "Saved model checkpoint number. If -1: will load the last checkpoint. Overrides config file if provided."},
+        {"name": "--iter", "type": int, "help": "Iteration number of the checkpoint to load (model_<iter>.pt). Overrides --checkpoint. If omitted: load the latest."},
 
         {"name": "--headless", "action": "store_true", "default": False, "help": "Force display off at all times"},
         {"name": "--horovod", "action": "store_true", "default": False, "help": "Use horovod for multi-gpu training"},
